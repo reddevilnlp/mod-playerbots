@@ -13,7 +13,9 @@
 #include "GenericSpellActions.h"
 #include "Group.h"
 #include "InstanceScript.h"
+#include "Log.h"
 #include "MotionMaster.h"
+#include "MoveSpline.h"
 #include "Multiplier.h"
 #include "Naxx40Encounter.h"
 #include "Pet.h"
@@ -92,9 +94,14 @@ bool IsTank(Unit* unit)
     return player && player->IsAlive() && (PlayerbotAI::IsTank(player) || PlayerbotAI::IsExplicitMainTank(player));
 }
 
+bool InForcedJump(Unit const& unit)
+{
+    return unit.GetMotionMaster()->GetMotionSlotType(MOTION_SLOT_CONTROLLED) == EFFECT_MOTION_TYPE;
+}
+
 bool IsOnAddPlatform(Unit const& unit, uint8 side)
 {
-    return unit.GetPositionZ() >= AddPlatformZ - AddPlatformTolerance &&
+    return !InForcedJump(unit) && !unit.IsFalling() && unit.GetPositionZ() >= AddPlatformZ - AddPlatformTolerance &&
         unit.GetExactDist2dSq(TankPositions[side]) <= AddPlatformRadius * AddPlatformRadius;
 }
 
@@ -153,15 +160,10 @@ Thaddius40::OpeningAssignment AssignForCombat(Player* bot, Fight const& fight)
             return {side, true};
     }
 
+    // After landing, use the current platform while the adds update their victims.
     uint8 const otherSide = 1 - assignment.side;
     if (assignment.tank && IsOnAddPlatform(*bot, otherSide))
-    {
-        Creature* assigned = fight.adds[assignment.side];
-        Creature* other = fight.adds[otherSide];
-        if (CanAttack(assigned) && HasTankOnSide(*assigned, assignment.side) && CanAttack(other) &&
-            !HasTankOnSide(*other, otherSide))
-            assignment.side = otherSide;
-    }
+        assignment.side = otherSide;
     return assignment;
 }
 
@@ -243,6 +245,11 @@ public:
         Fight const fight = ReadFight(bot);
         if (!fight.boss)
             return false;
+        if (CanAttack(fight.adds[0]) || CanAttack(fight.adds[1]))
+        {
+            platformJump = 0;
+            reportedPolarity = 0;
+        }
         if (CanAttack(fight.boss))
             return HandleBoss(fight.boss);
 
@@ -250,6 +257,8 @@ public:
         if (CanAttack(fight.adds[0]) || CanAttack(fight.adds[1]))
             return HandleAdds(fight);
 
+        _awaitingTankLanding = false;
+        _tankAdd = 0;
         bool const stopped = StopDamage(bot);
         return ReachPlatform(Center) || stopped;
     }
@@ -267,8 +276,30 @@ private:
 
     bool HandleAdds(Fight const& fight)
     {
+        if (InForcedJump(*bot) || bot->IsFalling())
+        {
+            if (!_awaitingTankLanding && IsTank(bot))
+            {
+                _awaitingTankLanding = true;
+                G3D::Vector3 const destination = bot->movespline->FinalDestination();
+                LOG_INFO("playerbots", "[Naxx40] Thaddius tank {} airborne from add {} at ({:.2f},{:.2f},{:.2f}) "
+                    "to ({:.2f},{:.2f},{:.2f})",
+                    bot->GetName(), _tankAdd, bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(),
+                    destination.x, destination.y, destination.z);
+            }
+            return StopDamage(bot);
+        }
+
         Thaddius40::OpeningAssignment const assignment = AssignForCombat(bot, fight);
         Creature* add = fight.adds[assignment.side];
+        _tankAdd = assignment.tank && add ? add->GetEntry() : 0;
+        if (_awaitingTankLanding)
+        {
+            _awaitingTankLanding = false;
+            AI_VALUE(LastMovement&, "last movement").clear();
+            LOG_INFO("playerbots", "[Naxx40] Thaddius tank {} grounded, assigned add {} at ({:.2f},{:.2f},{:.2f})",
+                bot->GetName(), _tankAdd, bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ());
+        }
         if (!CanAttack(add))
             return StopDamage(bot);
 
@@ -289,9 +320,16 @@ private:
                     return MoveToPosition(TankPositions[assignment.side], 3.0f) || stopped;
 
                 if (addVictim && bot->IsWithinLOSInMap(add))
+                {
                     if (char const* taunt = TauntSpell(bot); taunt && botAI->CanCastSpell(taunt, add) &&
                         botAI->CastSpell(taunt, add))
+                    {
+                        LOG_INFO("playerbots", "[Naxx40] Thaddius tank {} taunted add {} from ({:.2f},{:.2f},{:.2f})",
+                            bot->GetName(), add->GetEntry(), bot->GetPositionX(), bot->GetPositionY(),
+                            bot->GetPositionZ());
                         return true;
+                    }
+                }
 
                 if (!bot->IsWithinMeleeRange(add))
                     return MoveNear(add, 1.0f, MovementPriority::MOVEMENT_COMBAT) || stopped;
@@ -317,6 +355,21 @@ private:
 
     bool ReachPlatform(Position const& destination)
     {
+        auto const& spline = *bot->movespline;
+        if (platformJump)
+        {
+            if (InForcedJump(*bot) || bot->IsFalling() || (!spline.Finalized() && spline.GetId() == platformJump))
+                return false;
+            Position const& landing = JumpLandings[platformSide];
+            float const floor = bot->GetMapHeight(bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ() + 1.0f);
+            bool const landed = bot->GetExactDist2dSq(landing) <= 9.0f &&
+                std::abs(floor - BossPlatformZ) <= 1.0f && std::abs(bot->GetPositionZ() - floor) <= 1.0f;
+            LOG_INFO("playerbots", "[Naxx40] Thaddius jump {} bot={} side={} instance={} "
+                "pos=({:.2f},{:.2f},{:.2f}) floor={:.2f}",
+                landed ? "landed" : "missed", bot->GetName(), platformSide, bot->GetInstanceId(),
+                bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ(), floor);
+            platformJump = 0;
+        }
         if (bot->GetPositionZ() < AddPlatformZ - 3.0f)
             return MoveToPosition(destination);
 
@@ -325,8 +378,19 @@ private:
             return MoveToPosition(JumpLedges[side], 1.5f);
 
         Position const& landing = JumpLandings[side];
-        return JumpTo(bot->GetMapId(), landing.GetPositionX(), landing.GetPositionY(), landing.GetPositionZ(),
-                      MovementPriority::MOVEMENT_COMBAT);
+        uint32 const previousSpline = spline.GetId();
+        bool const started = JumpTo(bot->GetMapId(), landing.GetPositionX(), landing.GetPositionY(),
+                                    landing.GetPositionZ(), MovementPriority::MOVEMENT_COMBAT);
+        if (started && !spline.Finalized() && spline.GetId() != previousSpline)
+        {
+            platformJump = spline.GetId();
+            platformSide = side;
+            LOG_INFO("playerbots", "[Naxx40] Thaddius jump started bot={} side={} instance={} selfbot={} "
+                "pos=({:.2f},{:.2f},{:.2f})",
+                bot->GetName(), side, bot->GetInstanceId(), IsSelfBot(bot),
+                bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ());
+        }
+        return started;
     }
 
     bool HandleBoss(Creature* boss)
@@ -336,14 +400,17 @@ private:
         {
             AI_VALUE(LastMovement&, "last movement").clear();
             lastPolarity = polarity;
+            reportedPolarity = 0;
         }
 
         bool const ranged = !IsTank(bot) && (PlayerbotAI::IsRanged(bot) || PlayerbotAI::IsHeal(bot));
         Position const* destination = ranged || Polarity(boss->GetVictim()) ? &NeutralRanged : &Center;
+        Position const* chargePosition = nullptr;
         if (polarity)
         {
             uint8 const side = polarity > 0 ? 1 : 0;
-            destination = ranged ? &ChargeRanged[side] : &ChargeMelee[side];
+            chargePosition = ranged ? &ChargeRanged[side] : &ChargeMelee[side];
+            destination = chargePosition;
 
             // A bot starting across the room takes its own lane around the boss before stacking.
             Position const& crossing = ChargeCrossings[side];
@@ -354,19 +421,33 @@ private:
         }
 
         if (bot->GetExactDist2dSq(*destination) > 4.0f ||
-            std::abs(bot->GetPositionZ() - BossPlatformZ) >= 2.0f)
+            std::abs(bot->GetPositionZ() - BossPlatformZ) >= 2.0f || platformJump)
         {
             if (bot->HasUnitState(UNIT_STATE_CASTING) && botAI->CanMove())
                 bot->InterruptNonMeleeSpells(false, 0, false);
             return ReachPlatform(*destination);
         }
 
+        if (chargePosition && destination == chargePosition && polarity != reportedPolarity &&
+            !InForcedJump(*bot) && !bot->IsFalling())
+        {
+            reportedPolarity = polarity;
+            LOG_INFO("playerbots", "[Naxx40] Thaddius polarity settled bot={} charge={} instance={} "
+                "pos=({:.2f},{:.2f},{:.2f})",
+                bot->GetName(), int(polarity), bot->GetInstanceId(),
+                bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ());
+        }
         if (AI_VALUE(Unit*, "current target") != boss || bot->GetVictim() != boss)
             return Attack(boss);
         return false;
     }
 
     int8 lastPolarity = 0;
+    int8 reportedPolarity = 0;
+    uint32 platformJump = 0;
+    uint8 platformSide = 0;
+    bool _awaitingTankLanding = false;
+    uint32 _tankAdd = 0;
 };
 
 class Thaddius40Trigger final : public Trigger
