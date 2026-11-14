@@ -232,12 +232,21 @@ public:
     bool Execute(Event event) override;
 };
 
+namespace Anub40
+{
+    bool HasLocustSwarm(Unit const& boss);
+    bool IsActiveBoss(Unit const* boss);
+}
+
 class AnubrekhanPositionAction : public RotateAroundTheCenterPointAction
 {
 public:
     AnubrekhanPositionAction(PlayerbotAI* botAI)
         : RotateAroundTheCenterPointAction(botAI, "anub'rekhan position", 3272.49f, -3476.27f, 45.0f, 16) {}
     bool Execute(Event event) override;
+
+private:
+    bool PositionNaxx40(Unit& boss);
 };
 
 class GluthChooseTargetAction : public AttackAction

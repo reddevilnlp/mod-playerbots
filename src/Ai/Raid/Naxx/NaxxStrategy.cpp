@@ -57,9 +57,15 @@ void RaidNaxxStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
     );
 
     // Anub'Rekhan
-    triggers.push_back(new TriggerNode("anub'rekhan",
-        { NextAction("anub'rekhan position", ACTION_RAID + 1) }
-    ));
+    if (naxx40)
+        triggers.push_back(new TriggerNode("anub'rekhan", {
+            NextAction("anub'rekhan position", ACTION_RAID + 4),
+            NextAction("anub'rekhan choose target", ACTION_RAID + 1)
+        }));
+    else
+        triggers.push_back(new TriggerNode("anub'rekhan", {
+            NextAction("anub'rekhan position", ACTION_RAID + 1)
+        }));
 
      // Grand Widow Faerlina
      triggers.push_back(new TriggerNode("faerlina",

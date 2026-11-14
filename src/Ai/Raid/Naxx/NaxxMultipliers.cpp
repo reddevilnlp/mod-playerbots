@@ -228,6 +228,17 @@ float AnubrekhanGenericMultiplier::GetValue(Action* action)
     if (!boss)
         return 1.0f;
 
+    if (Anub40::IsActiveBoss(boss))
+    {
+        if (dynamic_cast<AnubrekhanPositionAction*>(action) || dynamic_cast<WipeAction*>(action))
+            return 1.0f;
+        if (Anub40::HasLocustSwarm(*boss) &&
+            (dynamic_cast<MovementAction*>(action) || dynamic_cast<CastReachTargetSpellAction*>(action) ||
+             dynamic_cast<CastMeleeSpellAction*>(action)))
+            return 0.0f;
+        return 1.0f;
+    }
+
     if (NaxxSpellIds::HasAnyAura(
             boss, {NaxxSpellIds::LocustSwarm10, NaxxSpellIds::LocustSwarm10Alt, NaxxSpellIds::LocustSwarm25}) ||
         botAI->HasAura("locust swarm", boss))
