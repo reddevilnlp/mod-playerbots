@@ -14,6 +14,7 @@
 #include "Group.h"
 #include "InstanceScript.h"
 #include "Log.h"
+#include "Map.h"
 #include "MotionMaster.h"
 #include "MoveSpline.h"
 #include "Multiplier.h"
@@ -24,7 +25,9 @@
 #include "Spell.h"
 #include "SpellMgr.h"
 #include "Strategy.h"
+#include "Timer.h"
 #include "../Naxx/NaxxSpellIds.h"
+#include <algorithm>
 #include <array>
 #include <cmath>
 
@@ -37,6 +40,7 @@ constexpr float AddPlatformZ = 312.0f;
 constexpr float AddPlatformTolerance = 2.0f;
 constexpr float AddPlatformRadius = 30.0f;
 constexpr float BossPlatformZ = 304.02f;
+constexpr float ChargeArrivalRadius = 1.0f;
 Position const Center(3512.19f, -2928.58f, BossPlatformZ);
 Position const NeutralRanged(3504.68f, -2936.68f, BossPlatformZ);
 // Keep each add within a few yards of its IP spawn and its own Tesla Coil link.
@@ -48,13 +52,13 @@ std::array<Position, 2> const JumpLedges = {{{3462.99f, -2918.90f, AddPlatformZ}
                                             {3520.65f, -2976.51f, AddPlatformZ}}};
 std::array<Position, 2> const JumpLandings = {{{3471.36f, -2910.65f, BossPlatformZ},
                                               {3528.80f, -2967.04f, BossPlatformZ}}};
-std::array<Position, 2> const ChargeMelee = {{{3508.29f, -2920.12f, BossPlatformZ},
-                                             {3519.74f, -2931.69f, BossPlatformZ}}};
-std::array<Position, 2> const ChargeRanged = {{{3503.70f, -2915.49f, BossPlatformZ},
-                                              {3524.32f, -2936.26f, BossPlatformZ}}};
-// Separate lanes keep bots swapping in opposite directions from running through one another.
-std::array<Position, 2> const ChargeCrossings = {{{3508.30f, -2931.58f, BossPlatformZ},
-                                                 {3519.70f, -2920.10f, BossPlatformZ}}};
+std::array<Position, 2> const ChargeMelee = {{{3508.29f, -2920.12f, 302.862f},
+                                             {3519.74f, -2931.69f, 302.865f}}};
+std::array<Position, 2> const ChargeRanged = {{{3506.60f, -2918.42f, 302.878f},
+                                              {3521.43f, -2933.39f, 302.881f}}};
+// Both signs circulate in the same direction. The northeast lane is constrained by the platform edge.
+std::array<Position, 2> const ChargeLanes = {{{3504.797f, -2930.807f, 303.075f},
+                                             {3519.324f, -2924.872f, 302.727f}}};
 
 struct Fight
 {
@@ -235,6 +239,41 @@ int8 Polarity(Unit const* unit)
     return 0;
 }
 
+Position const& ChargePosition(Player* bot, uint8 side)
+{
+    bool const ranged = !IsTank(bot) && (PlayerbotAI::IsRanged(bot) || PlayerbotAI::IsHeal(bot));
+    return ranged ? ChargeRanged[side] : ChargeMelee[side];
+}
+
+bool AtChargePosition(Player const& bot, Position const& position)
+{
+    return bot.GetExactDist2dSq(position) <= ChargeArrivalRadius * ChargeArrivalRadius &&
+        std::abs(bot.GetPositionZ() - position.GetPositionZ()) < 1.0f;
+}
+
+bool IsDryChargeLeg(Player const& bot, G3D::Vector3 const& start, G3D::Vector3 const& end)
+{
+    Map* map = bot.GetMap();
+    uint32 const phase = bot.GetPhaseMask();
+    if (!map->isInLineOfSight(start.x, start.y, start.z + 0.85f, end.x, end.y, end.z + 0.85f,
+                             phase, LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::Nothing))
+        return false;
+
+    G3D::Vector3 const leg = end - start;
+    unsigned const samples = std::max(1u, static_cast<unsigned>(std::ceil(leg.length() / 2.0f)));
+    for (unsigned sample = 1; sample <= samples; ++sample)
+    {
+        G3D::Vector3 const point = start + leg * (static_cast<float>(sample) / samples);
+        PositionFullTerrainStatus terrain;
+        map->GetFullTerrainStatusForPosition(phase, point.x, point.y, point.z + 0.6f,
+                                             bot.GetCollisionHeight(), terrain);
+        if (std::abs(terrain.floorZ - point.z) > 0.65f ||
+            (terrain.liquidInfo.Status != LIQUID_MAP_NO_WATER && terrain.liquidInfo.Level > terrain.floorZ))
+            return false;
+    }
+    return true;
+}
+
 class Thaddius40Action final : public AttackAction
 {
 public:
@@ -254,6 +293,7 @@ public:
             return HandleBoss(fight.boss);
 
         lastPolarity = 0;
+        _crossing = false;
         if (CanAttack(fight.adds[0]) || CanAttack(fight.adds[1]))
             return HandleAdds(fight);
 
@@ -353,7 +393,7 @@ private:
         return stopped;
     }
 
-    bool ReachPlatform(Position const& destination)
+    bool ReachPlatform(Position const& destination, float arrivalRadius = 2.0f)
     {
         auto const& spline = *bot->movespline;
         if (platformJump)
@@ -371,7 +411,7 @@ private:
             platformJump = 0;
         }
         if (bot->GetPositionZ() < AddPlatformZ - 3.0f)
-            return MoveToPosition(destination);
+            return MoveToPosition(destination, arrivalRadius);
 
         uint8 const side = bot->GetExactDist2dSq(JumpLedges[0]) <= bot->GetExactDist2dSq(JumpLedges[1]) ? 0 : 1;
         if (bot->GetExactDist2dSq(JumpLedges[side]) > 2.25f)
@@ -393,44 +433,100 @@ private:
         return started;
     }
 
+    bool CrossChargeLane(uint8 side, Position const& destination)
+    {
+        auto const& spline = *bot->movespline;
+        if (!botAI->CanMove() || bot->IsFalling())
+            return false;
+        if (_crossingSpline && spline.GetId() == _crossingSpline)
+        {
+            _pastChargeLane = _pastChargeLane || spline.currentPathIdx() > 0;
+            if (!spline.Finalized())
+                return false;
+        }
+        if (_crossingSpline && bot->GetExactDist2dSq(ChargeMelee[side]) < bot->GetExactDist2dSq(ChargeMelee[1 - side]))
+            _pastChargeLane = true;
+
+        uint32 const now = getMSTime();
+        if (_lastCrossingAttempt && now - _lastCrossingAttempt < 500)
+            return false;
+        bool const firstAttempt = !_lastCrossingAttempt;
+        _lastCrossingAttempt = now;
+
+        G3D::Vector3 const start{bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ()};
+        G3D::Vector3 const end{destination.GetPositionX(), destination.GetPositionY(), destination.GetPositionZ()};
+        Position const& lane = ChargeLanes[side];
+        G3D::Vector3 const waypoint{lane.GetPositionX(), lane.GetPositionY(), lane.GetPositionZ()};
+        // Two-point escort paths are recomputed by the core. Keep the two checked legs.
+        G3D::Vector3 const middle = _pastChargeLane ? (start + end) * 0.5f : waypoint;
+        if (!IsDryChargeLeg(*bot, start, middle) || !IsDryChargeLeg(*bot, middle, end))
+        {
+            if (firstAttempt)
+                LOG_WARN("playerbots", "[Naxx40] Thaddius polarity lane blocked bot={} charge={} instance={} "
+                    "pos=({:.2f},{:.2f},{:.2f})", bot->GetName(), int(lastPolarity), bot->GetInstanceId(),
+                    start.x, start.y, start.z);
+            return false;
+        }
+
+        Movement::PointsArray path{start, middle, end};
+        uint32 const previousSpline = spline.GetId();
+        if (bot->IsSitState())
+            bot->SetStandState(UNIT_STAND_STATE_STAND);
+        bot->CastStop();
+        bot->GetMotionMaster()->MoveSplinePath(&path, FORCED_MOVEMENT_RUN);
+        if (spline.Finalized() || spline.GetId() == previousSpline)
+            return false;
+
+        _crossingSpline = spline.GetId();
+        AI_VALUE(LastMovement&, "last movement").Set(bot->GetMapId(), end.x, end.y, end.z, bot->GetOrientation(),
+                                                    spline.Duration(), MovementPriority::MOVEMENT_COMBAT);
+        LOG_INFO("playerbots", "[Naxx40] Thaddius polarity lane started bot={} charge={} instance={} duration={}ms "
+            "via=({:.2f},{:.2f},{:.2f}) pos=({:.2f},{:.2f},{:.2f})",
+            bot->GetName(), int(lastPolarity), bot->GetInstanceId(), spline.Duration(),
+            middle.x, middle.y, middle.z, start.x, start.y, start.z);
+        return true;
+    }
+
     bool HandleBoss(Creature* boss)
     {
         int8 const polarity = Polarity(bot);
         if (polarity != lastPolarity && botAI->CanMove())
         {
             AI_VALUE(LastMovement&, "last movement").clear();
+            _crossing = polarity && lastPolarity;
+            _crossingSpline = 0;
+            _pastChargeLane = false;
+            _lastCrossingAttempt = 0;
             lastPolarity = polarity;
             reportedPolarity = 0;
+            if (polarity)
+                LOG_INFO("playerbots", "[Naxx40] Thaddius polarity assigned bot={} charge={} instance={} swap={}",
+                    bot->GetName(), int(polarity), bot->GetInstanceId(), _crossing);
         }
 
         bool const ranged = !IsTank(bot) && (PlayerbotAI::IsRanged(bot) || PlayerbotAI::IsHeal(bot));
         Position const* destination = ranged || Polarity(boss->GetVictim()) ? &NeutralRanged : &Center;
-        Position const* chargePosition = nullptr;
+        bool mustMove = bot->GetExactDist2dSq(*destination) > 4.0f ||
+            std::abs(bot->GetPositionZ() - BossPlatformZ) >= 2.0f || platformJump;
         if (polarity)
         {
             uint8 const side = polarity > 0 ? 1 : 0;
-            chargePosition = ranged ? &ChargeRanged[side] : &ChargeMelee[side];
-            destination = chargePosition;
-
-            // A bot starting across the room takes its own lane around the boss before stacking.
-            Position const& crossing = ChargeCrossings[side];
-            float const ownDistance = bot->GetExactDist2dSq(ChargeMelee[side]);
-            float const oppositeDistance = bot->GetExactDist2dSq(ChargeMelee[1 - side]);
-            if (oppositeDistance + 18.0f < ownDistance && bot->GetExactDist2dSq(crossing) > 6.25f)
-                destination = &crossing;
+            destination = &ChargePosition(bot, side);
+            mustMove = !AtChargePosition(*bot, *destination) || platformJump;
+            if (mustMove && _crossing && !platformJump && bot->GetPositionZ() < AddPlatformZ - 3.0f)
+                return CrossChargeLane(side, *destination);
         }
 
-        if (bot->GetExactDist2dSq(*destination) > 4.0f ||
-            std::abs(bot->GetPositionZ() - BossPlatformZ) >= 2.0f || platformJump)
+        if (mustMove)
         {
             if (bot->HasUnitState(UNIT_STATE_CASTING) && botAI->CanMove())
                 bot->InterruptNonMeleeSpells(false, 0, false);
-            return ReachPlatform(*destination);
+            return ReachPlatform(*destination, polarity ? ChargeArrivalRadius : 2.0f);
         }
 
-        if (chargePosition && destination == chargePosition && polarity != reportedPolarity &&
-            !InForcedJump(*bot) && !bot->IsFalling())
+        if (polarity && polarity != reportedPolarity && !InForcedJump(*bot) && !bot->IsFalling())
         {
+            _crossing = false;
             reportedPolarity = polarity;
             LOG_INFO("playerbots", "[Naxx40] Thaddius polarity settled bot={} charge={} instance={} "
                 "pos=({:.2f},{:.2f},{:.2f})",
@@ -444,6 +540,10 @@ private:
 
     int8 lastPolarity = 0;
     int8 reportedPolarity = 0;
+    bool _crossing = false;
+    bool _pastChargeLane = false;
+    uint32 _crossingSpline = 0;
+    uint32 _lastCrossingAttempt = 0;
     uint32 platformJump = 0;
     uint8 platformSide = 0;
     bool _awaitingTankLanding = false;
@@ -473,7 +573,11 @@ public:
             return 0.0f;
 
         if (CanAttack(fight.boss))
-            return 1.0f;
+        {
+            int8 const polarity = Polarity(bot);
+            bool const traveling = polarity && !AtChargePosition(*bot, ChargePosition(bot, polarity > 0 ? 1 : 0));
+            return traveling && (melee || dynamic_cast<CastSpellAction*>(action)) ? 0.0f : 1.0f;
+        }
 
         if (EncounterHelpers::IsTauntAction(bot, action) || EncounterHelpers::IsAoeThreatAction(bot, action))
             return 0.0f;
