@@ -11,6 +11,8 @@
 #include "MagValueContext.h"
 #include "MechValueContext.h"
 #include "MgTValueContext.h"
+#include "Naxx40Slime.h"
+#include "Patchwerk40.h"
 #include "SSCValueContext.h"
 #include "TKValueContext.h"
 #include "UBValueContext.h"
@@ -21,6 +23,8 @@ void AiObjectContext::BuildSharedValueContexts(
     SharedNamedObjectContextList<UntypedValue>& valueContexts)
 {
     valueContexts.Add(new ValueContext());
+    valueContexts.Add(new Naxx40SlimeValueContext());
+    valueContexts.Add(new Patchwerk40ValueContext());
     valueContexts.Add(new RaidGruulsLairValueContext());
     valueContexts.Add(new RaidHyjalValueContext());
     valueContexts.Add(new RaidMagtheridonValueContext());

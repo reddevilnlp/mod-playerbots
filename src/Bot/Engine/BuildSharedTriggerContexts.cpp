@@ -6,24 +6,31 @@
 
 #include "AiObjectContext.h"
 #include "Aq20TriggerContext.h"
+#include "Aq40TriggerContext.h"
 #include "BTTriggerContext.h"
 #include "BWLTriggerContext.h"
 #include "ChatTriggerContext.h"
 #include "EoETriggerContext.h"
+#include "Gluth40.h"
+#include "Grobbulus40.h"
 #include "GruulTriggerContext.h"
 #include "HyjalTriggerContext.h"
 #include "ICCTriggerContext.h"
 #include "KaraTriggerContext.h"
 #include "MCTriggerContext.h"
 #include "MagTriggerContext.h"
+#include "Naxx40Slime.h"
 #include "NaxxTriggerContext.h"
 #include "OSTriggerContext.h"
 #include "OnyTriggerContext.h"
+#include "Patchwerk40.h"
 #include "RSTriggerContext.h"
 #include "RaidClearContexts.h"
 #include "SSCTriggerContext.h"
+#include "Sapphiron40.h"
 #include "TKTriggerContext.h"
 #include "TbcDungeonTriggerContext.h"
+#include "Thaddius40.h"
 #include "TriggerContext.h"
 #include "UldTriggerContext.h"
 #include "VanillaDungeonTriggerContext.h"
@@ -39,12 +46,19 @@ void AiObjectContext::BuildSharedTriggerContexts(
     triggerContexts.Add(new ChatTriggerContext());
     triggerContexts.Add(new WorldPacketTriggerContext());
     triggerContexts.Add(new RaidAq20TriggerContext());
+    triggerContexts.Add(new RaidAq40TriggerContext());
     triggerContexts.Add(new RaidMcTriggerContext());
     triggerContexts.Add(new RaidBwlTriggerContext());
     triggerContexts.Add(new RaidKarazhanTriggerContext());
     triggerContexts.Add(new RaidGruulsLairTriggerContext());
     triggerContexts.Add(new RaidMagtheridonTriggerContext());
     triggerContexts.Add(new RaidNaxxTriggerContext());
+    triggerContexts.Add(new Naxx40SlimeTriggerContext());
+    triggerContexts.Add(new Patchwerk40TriggerContext());
+    triggerContexts.Add(new Gluth40TriggerContext());
+    triggerContexts.Add(new Grobbulus40TriggerContext());
+    triggerContexts.Add(new Sapphiron40TriggerContext());
+    triggerContexts.Add(new Thaddius40TriggerContext());
     triggerContexts.Add(new RaidSscTriggerContext());
     triggerContexts.Add(new RaidTempestKeepTriggerContext());
     triggerContexts.Add(new RaidHyjalTriggerContext());

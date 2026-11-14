@@ -7,24 +7,31 @@
 #include "ActionContext.h"
 #include "AiObjectContext.h"
 #include "Aq20ActionContext.h"
+#include "Aq40ActionContext.h"
 #include "BTActionContext.h"
 #include "BWLActionContext.h"
 #include "ChatActionContext.h"
 #include "EoEActionContext.h"
+#include "Gluth40.h"
+#include "Grobbulus40.h"
 #include "GruulActionContext.h"
 #include "HyjalActionContext.h"
 #include "ICCActionContext.h"
 #include "KaraActionContext.h"
 #include "MCActionContext.h"
 #include "MagActionContext.h"
+#include "Naxx40Slime.h"
 #include "NaxxActionContext.h"
 #include "OSActionContext.h"
 #include "OnyActionContext.h"
+#include "Patchwerk40.h"
 #include "RSActionContext.h"
 #include "RaidClearContexts.h"
 #include "SSCActionContext.h"
+#include "Sapphiron40.h"
 #include "TKActionContext.h"
 #include "TbcDungeonActionContext.h"
+#include "Thaddius40.h"
 #include "UldActionContext.h"
 #include "VanillaDungeonActionContext.h"
 #include "VoAActionContext.h"
@@ -39,6 +46,7 @@ void AiObjectContext::BuildSharedActionContexts(
     actionContexts.Add(new ChatActionContext());
     actionContexts.Add(new WorldPacketActionContext());
     actionContexts.Add(new RaidAq20ActionContext());
+    actionContexts.Add(new RaidAq40ActionContext());
     actionContexts.Add(new RaidMcActionContext());
     actionContexts.Add(new RaidBwlActionContext());
     actionContexts.Add(new RaidKarazhanActionContext());
@@ -50,6 +58,12 @@ void AiObjectContext::BuildSharedActionContexts(
     actionContexts.Add(new RaidBlackTempleActionContext());
     actionContexts.Add(new RaidZulAmanActionContext());
     actionContexts.Add(new RaidNaxxActionContext());
+    actionContexts.Add(new Naxx40SlimeActionContext());
+    actionContexts.Add(new Patchwerk40ActionContext());
+    actionContexts.Add(new Gluth40ActionContext());
+    actionContexts.Add(new Grobbulus40ActionContext());
+    actionContexts.Add(new Sapphiron40ActionContext());
+    actionContexts.Add(new Thaddius40ActionContext());
     actionContexts.Add(new RaidOsActionContext());
     actionContexts.Add(new RaidEoEActionContext());
     actionContexts.Add(new RaidVoAActionContext());

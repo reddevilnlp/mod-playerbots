@@ -33,6 +33,8 @@
 #include "MapMgr.h"
 #include "MotionMaster.h"
 #include "MoveSplineInit.h"
+#include "Naxx40Encounter.h"
+#include "Naxx40Slime.h"
 #include "NewRpgStrategy.h"
 #include "ObjectGuid.h"
 #include "ObjectMgr.h"
@@ -1955,8 +1957,9 @@ void PlayerbotAI::ApplyInstanceStrategies(uint32 mapId, bool tellMaster)
 {
     static const std::vector<std::string> allInstanceStrategies =
     {
-        "aq20", "blacktemple", "bwl", "gruulslair", "hyjal", "icc", "karazhan", "magtheridon",
-        "moltencore", "naxx", "onyxia", "rs", "ssc", "tbc-ac", "tbc-mech", "tbc-mgt", "tbc-ramp",
+        "aq20", "aq40 cthun", "blacktemple", "bwl", "gruulslair", "hyjal", "icc", "karazhan", "magtheridon",
+        "moltencore", "naxx", "naxx40 grobbulus", Naxx40SlimeStrategyName, "onyxia", "rs", "ssc", "tbc-ac",
+        "tbc-mech", "tbc-mgt", "tbc-ramp",
         "tbc-seth", "tbc-ub", "tempestkeep", "ulduar", "vanilla-sm", "voa", "wotlk-an", "wotlk-cos",
         "wotlk-dtk", "wotlk-eoe", "wotlk-fos", "wotlk-gd", "wotlk-hol", "wotlk-hos", "wotlk-nex",
         "wotlk-occ", "wotlk-ok", "wotlk-os", "wotlk-pos", "wotlk-toc", "wotlk-uk", "wotlk-up",
@@ -1996,6 +1999,9 @@ void PlayerbotAI::ApplyInstanceStrategies(uint32 mapId, bool tellMaster)
             break;
         case 509:
             strategyName = "aq20";  // Ruins of Ahn'Qiraj
+            break;
+        case 531:
+            strategyName = "aq40 cthun";
             break;
         case 532:
             strategyName = "karazhan";  // Karazhan
@@ -2114,6 +2120,12 @@ void PlayerbotAI::ApplyInstanceStrategies(uint32 mapId, bool tellMaster)
 
     engines[BOT_STATE_COMBAT]->addStrategy(strategyName);
     engines[BOT_STATE_NON_COMBAT]->addStrategy(strategyName);
+    if (mapId == 533 && IsNaxx40Map(bot->FindMap()))
+    {
+        engines[BOT_STATE_COMBAT]->addStrategy("naxx40 grobbulus");
+        engines[BOT_STATE_COMBAT]->addStrategy(Naxx40SlimeStrategyName);
+        engines[BOT_STATE_NON_COMBAT]->addStrategy(Naxx40SlimeStrategyName);
+    }
 
     if (tellMaster && !strategyName.empty())
     {

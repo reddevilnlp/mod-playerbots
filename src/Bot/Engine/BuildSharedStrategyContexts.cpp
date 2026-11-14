@@ -6,6 +6,8 @@
 
 #include "AiObjectContext.h"
 #include "DungeonStrategyContext.h"
+#include "Grobbulus40.h"
+#include "Naxx40Slime.h"
 #include "RaidClearContexts.h"
 #include "RaidStrategyContext.h"
 #include "StrategyContext.h"
@@ -19,4 +21,6 @@ void AiObjectContext::BuildSharedStrategyContexts(SharedNamedObjectContextList<S
     strategyContexts.Add(new DungeonStrategyContext());
     strategyContexts.Add(new RaidStrategyContext());
     strategyContexts.Add(new RaidClearStrategyContext());
+    strategyContexts.Add(new Grobbulus40StrategyContext());
+    strategyContexts.Add(new Naxx40SlimeStrategyContext());
 }

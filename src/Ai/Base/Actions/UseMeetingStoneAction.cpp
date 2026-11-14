@@ -9,6 +9,7 @@
 #include "Event.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
+#include "Naxx40Encounter.h"
 #include "NearestGameObjects.h"
 #include "PlayerbotAIConfig.h"
 #include "PlayerbotTextMgr.h"
@@ -176,6 +177,7 @@ bool SummonAction::Teleport(Player* summoner, Player* player, bool preserveAuras
 
     if (!summoner->IsBeingTeleported() && !player->IsBeingTeleported())
     {
+        bool const naxx40 = IsNaxx40Map(summoner->FindMap());
         float followAngle = GetFollowAngle();
         for (float angle = followAngle - M_PI; angle <= followAngle + M_PI; angle += M_PI / 4)
         {
@@ -184,7 +186,20 @@ bool SummonAction::Teleport(Player* summoner, Player* player, bool preserveAuras
             float y = summoner->GetPositionY() + sin(angle) * sPlayerbotAIConfig.FollowDistance;
             float z = summoner->GetPositionZ();
 
-            if (summoner->IsWithinLOS(x, y, z))
+            bool destinationValid = false;
+            if (naxx40)
+            {
+                auto const landing = GetNaxx40Landing(*summoner, *player, x, y);
+                if (landing)
+                {
+                    z = landing->GetPositionZ();
+                    destinationValid = true;
+                }
+            }
+            else
+                destinationValid = summoner->IsWithinLOS(x, y, z);
+
+            if (destinationValid)
             {
                 if (sPlayerbotAIConfig.BotRepairWhenSummon)  // .conf option to repair bot gear when summoned 0 = off, 1 = on
                     bot->DurabilityRepairAll(false, 1.0f, false);
