@@ -2123,6 +2123,7 @@ void PlayerbotAI::ApplyInstanceStrategies(uint32 mapId, bool tellMaster)
     if (mapId == 533 && IsNaxx40Map(bot->FindMap()))
     {
         engines[BOT_STATE_COMBAT]->addStrategy("naxx40 grobbulus");
+        engines[BOT_STATE_NON_COMBAT]->addStrategy("naxx40 grobbulus");
         engines[BOT_STATE_COMBAT]->addStrategy(Naxx40SlimeStrategyName);
         engines[BOT_STATE_NON_COMBAT]->addStrategy(Naxx40SlimeStrategyName);
     }

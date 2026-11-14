@@ -11,6 +11,18 @@
 #include "NamedObjectContext.h"
 #include "Strategy.h"
 #include "Trigger.h"
+#include "MoveSplineInitArgs.h"
+
+class Player;
+
+namespace Naxx40GrobbulusClouds
+{
+    bool OnRoomFloor(Player const& player);
+    bool IsEntry(uint32 entry);
+    bool HasPendingInjection(Player const& player);
+    bool NeedsEscape(Player& player);
+    bool ClearsPath(Player& player, Movement::PointsArray const& path);
+}
 
 class Grobbulus40ActionContext final : public NamedObjectContext<Action>
 {

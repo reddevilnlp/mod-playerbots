@@ -20,6 +20,7 @@
 #include "Playerbots.h"
 #include "ReachTargetActions.h"
 #include "SpellAuraEffects.h"
+#include "TemporarySummon.h"
 #include "Timer.h"
 
 namespace
@@ -31,6 +32,8 @@ constexpr uint32 GrobbulusEncounter = 1;
 constexpr uint32 GrobbulusEntry = 351003;
 constexpr uint32 PoisonAura = 28158;
 constexpr uint32 HeroicPoisonAura = 54362;
+constexpr uint32 MutatingInjection = 28169;
+constexpr uint32 FreshCloudTimer = 73000;
 constexpr uint32 SnapshotInterval = 250;
 constexpr float BossSearchRadius = 240.0f;
 constexpr float CloudSearchRadius = 140.0f;
@@ -52,40 +55,59 @@ G3D::Vector3 Location(Position const& position)
 
 std::vector<Cloud> const* ObserveClouds(Player* bot)
 {
-    if (!bot->IsAlive() || !bot->IsInCombat() || !IsNaxx40Map(bot->FindMap()))
+    if (!bot->IsAlive() || !IsNaxx40Map(bot->FindMap()))
         return nullptr;
 
     InstanceScript const* instance = bot->GetInstanceScript();
-    if (!instance || instance->GetBossState(GrobbulusEncounter) != IN_PROGRESS)
+    if (!instance)
+        return nullptr;
+    bool const postKill = instance->IsBossDone(GrobbulusEncounter);
+    if (postKill ? !Naxx40GrobbulusClouds::OnRoomFloor(*bot)
+                 : !bot->IsInCombat() || instance->GetBossState(GrobbulusEncounter) != IN_PROGRESS)
         return nullptr;
 
     // The map updates serially on its worker. Share the scan across the raid without retaining world object pointers.
     thread_local uint32 instanceId = 0;
     thread_local uint32 sampledAt = 0;
+    thread_local bool sampledPostKill = false;
     thread_local std::vector<Cloud> clouds;
     uint32 const now = getMSTime();
-    if (sampledAt && instanceId == bot->GetInstanceId() && now - sampledAt < SnapshotInterval)
+    if (sampledAt && instanceId == bot->GetInstanceId() && sampledPostKill == postKill &&
+        now - sampledAt < SnapshotInterval)
         return &clouds;
 
-    Creature const* boss = bot->FindNearestCreature(GrobbulusEntry, BossSearchRadius);
-    if (!boss || !boss->IsInCombat())
+    Creature const* boss = postKill ? nullptr : bot->FindNearestCreature(GrobbulusEntry, BossSearchRadius);
+    if (!postKill && (!boss || !boss->IsInCombat()))
         return nullptr;
 
     instanceId = bot->GetInstanceId();
     sampledAt = now;
+    sampledPostKill = postKill;
     clouds.clear();
     std::list<Creature*> nearby;
-    boss->GetCreatureListWithEntryInGrid(nearby, CloudEntries, CloudSearchRadius);
-    for (Creature const* cloud : nearby)
+    if (postKill)
+        bot->GetCreatureListWithEntryInGrid(nearby, CloudEntries, 200.0f);
+    else
+        boss->GetCreatureListWithEntryInGrid(nearby, CloudEntries, CloudSearchRadius);
+    for (Creature* cloud : nearby)
     {
+        if (!cloud->IsAlive() || (postKill && !bot->InSamePhase(cloud)))
+            continue;
         AuraEffect const* aura = cloud->GetAuraEffect(PoisonAura, EFFECT_0);
         if (!aura)
             aura = cloud->GetAuraEffect(HeroicPoisonAura, EFFECT_0);
-        if (cloud->IsAlive() && aura)
+        if (aura)
         {
             // SpellAuraEffects scales the 30-yard base radius to 2 + 0.3 * tick, in exact 3D distance.
             float const nextRadius = 2.0f + 0.3f * static_cast<float>(aura->GetTickNumber() + 1);
             clouds.push_back({Location(*cloud), nextRadius + EscapeMargin});
+        }
+        // Newly summoned clouds apply their damage aura after the first timer tick.
+        // An older aura-less shell has already stopped doing damage.
+        else if (postKill)
+        {
+            if (TempSummon* summon = cloud->ToTempSummon(); summon && summon->GetTimer() >= FreshCloudTimer)
+                clouds.push_back({Location(*cloud), 2.6f + EscapeMargin});
         }
     }
     return &clouds;
@@ -196,6 +218,8 @@ private:
         float const depth = danger.radius - (start - danger.center).length();
         PathGenerator path(bot);
         path.SetPathLengthLimit(32.0f);
+        if (bot->GetInstanceScript()->IsBossDone(GrobbulusEncounter))
+            path.SetExcludeFlags(NAV_WATER | NAV_MAGMA | NAV_SLIME | NAV_GROUND_STEEP);
         for (float const distance : {depth + 3.0f, depth + 7.0f})
         {
             for (float const offset : {0.0f, Pi / 6.0f, -Pi / 6.0f, Pi / 3.0f, -Pi / 3.0f, Pi / 2.0f, -Pi / 2.0f})
@@ -308,6 +332,40 @@ public:
     }
 };
 }  // namespace
+
+bool Naxx40GrobbulusClouds::OnRoomFloor(Player const& player)
+{
+    return player.GetPositionZ() >= 290.0f && player.GetPositionZ() <= 295.0f &&
+        player.GetPositionX() >= 3189.0f && player.GetPositionX() <= 3337.0f &&
+        player.GetPositionY() >= -3340.0f && player.GetPositionY() <= -3258.0f;
+}
+
+bool Naxx40GrobbulusClouds::IsEntry(uint32 entry)
+{
+    return entry == CloudEntries[0] || entry == CloudEntries[1];
+}
+
+bool Naxx40GrobbulusClouds::HasPendingInjection(Player const& player)
+{
+    return OnRoomFloor(player) && player.HasAura(MutatingInjection);
+}
+
+bool Naxx40GrobbulusClouds::NeedsEscape(Player& player)
+{
+    auto const* clouds = ObserveClouds(&player);
+    return clouds && (::NeedsEscape(player, *clouds) || DeepestCloud(Location(player), *clouds));
+}
+
+bool Naxx40GrobbulusClouds::ClearsPath(Player& player, Movement::PointsArray const& path)
+{
+    auto const* clouds = ObserveClouds(&player);
+    if (!clouds || path.empty())
+        return true;
+    for (std::size_t i = 1; i < path.size(); ++i)
+        if (SegmentEntersCloud(path[i - 1], path[i], *clouds))
+            return false;
+    return !DeepestCloud(path.back(), *clouds);
+}
 
 Grobbulus40ActionContext::Grobbulus40ActionContext()
 {
