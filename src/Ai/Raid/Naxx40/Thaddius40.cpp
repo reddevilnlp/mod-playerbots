@@ -31,16 +31,9 @@ namespace
 constexpr char TacticsAction[] = "thaddius 40 tactics";
 constexpr char EncounterTrigger[] = "thaddius 40 active";
 
-// Individual Progression registers these entries in its Naxxramas instance script.
-constexpr uint32 ThaddiusEncounter = 9;
-constexpr uint32 StalaggData = 101;
-constexpr uint32 FeugenData = 102;
-constexpr uint32 ThaddiusData = 103;
-constexpr uint32 StalaggEntry = 351001;
-constexpr uint32 FeugenEntry = 351002;
-constexpr uint32 ThaddiusEntry = 351000;
-
 constexpr float AddPlatformZ = 312.0f;
+constexpr float AddPlatformTolerance = 2.0f;
+constexpr float AddPlatformRadius = 30.0f;
 constexpr float BossPlatformZ = 304.02f;
 Position const Center(3512.19f, -2928.58f, BossPlatformZ);
 Position const NeutralRanged(3504.68f, -2936.68f, BossPlatformZ);
@@ -85,11 +78,12 @@ Fight ReadFight(Player* bot)
         return {};
 
     InstanceScript* instance = bot->GetInstanceScript();
-    if (!instance || instance->GetBossState(ThaddiusEncounter) != IN_PROGRESS)
+    if (!instance || instance->GetBossState(Thaddius40::Encounter) != IN_PROGRESS)
         return {};
 
-    return {FindCreature(instance, ThaddiusData, ThaddiusEntry),
-            {FindCreature(instance, StalaggData, StalaggEntry), FindCreature(instance, FeugenData, FeugenEntry)}};
+    return {FindCreature(instance, Thaddius40::ThaddiusData, Thaddius40::ThaddiusEntry),
+            {FindCreature(instance, Thaddius40::StalaggData, Thaddius40::StalaggEntry),
+             FindCreature(instance, Thaddius40::FeugenData, Thaddius40::FeugenEntry)}};
 }
 
 bool IsTank(Unit* unit)
@@ -98,64 +92,77 @@ bool IsTank(Unit* unit)
     return player && player->IsAlive() && (PlayerbotAI::IsTank(player) || PlayerbotAI::IsExplicitMainTank(player));
 }
 
-// Tanks retain the add attacking them after Magnetic Pull. The designated main and assist
-// tanks otherwise claim separate adds, including when one add has not acquired a victim yet.
-struct Assignment
+bool IsOnAddPlatform(Unit const& unit, uint8 side)
 {
-    uint8 side;
-    bool tank;
-};
-
-uint8 RoleBucket(Player* member)
-{
-    if (PlayerbotAI::IsHeal(member))
-        return 0;
-    return PlayerbotAI::IsRanged(member) ? 1 : 2;
+    return unit.GetPositionZ() >= AddPlatformZ - AddPlatformTolerance &&
+        unit.GetExactDist2dSq(TankPositions[side]) <= AddPlatformRadius * AddPlatformRadius;
 }
 
-Assignment Assign(Player* bot, Fight const& fight)
+bool HasTankOnSide(Creature const& add, uint8 side)
 {
-    if (IsTank(bot))
-    {
-        for (uint8 side = 0; side < fight.adds.size(); ++side)
-            if (CanAttack(fight.adds[side]) && fight.adds[side]->GetVictim() == bot)
-                return {side, true};
+    Unit* victim = add.GetVictim();
+    return IsTank(victim) && IsOnAddPlatform(*victim, side);
+}
 
-        Player* main = EncounterHelpers::GetGroupMainTank(bot);
-        Player* assist = EncounterHelpers::GetGroupAssistTank(bot, 0);
-        if (!main || !main->IsInMap(bot))
-        {
-            main = assist;
-            assist = EncounterHelpers::GetGroupAssistTank(bot, 1);
-        }
+enum class OpeningRole
+{
+    Healer,
+    Ranged,
+    Melee,
+    ReserveTank
+};
 
-        if (bot == main || bot == assist)
-        {
-            uint8 side = bot == main ? 0 : 1;
-            if (CanAttack(fight.adds[side]) && IsTank(fight.adds[side]->GetVictim()))
-                side = 1 - side;
-            return {side, true};
-        }
-    }
+OpeningRole RoleBucket(Player* member)
+{
+    if (PlayerbotAI::IsTank(member))
+        return OpeningRole::ReserveTank;
+    if (PlayerbotAI::IsHeal(member))
+        return OpeningRole::Healer;
+    return PlayerbotAI::IsRanged(member) ? OpeningRole::Ranged : OpeningRole::Melee;
+}
 
-    Group* group = bot->GetGroup();
-    if (!group)
-        return {bot->GetExactDist2dSq(TankPositions[0]) > bot->GetExactDist2dSq(TankPositions[1]) ? uint8(1) : uint8(0),
-                IsTank(bot)};
-
-    // Alternating each role independently spreads healing and both types of damage evenly.
-    // Keep dead members in the order so a death does not swap everyone behind them.
-    uint8 const role = RoleBucket(bot);
-    uint8 side = role == 1 ? 1 : 0;
+Player* FindLocalTank(Player* player, Group* group, Player* main)
+{
+    Player* firstTank = nullptr;
     for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
     {
         Player* member = ref->GetSource();
-        if (member == bot)
-            break;
-        if (member && member->IsInMap(bot) && RoleBucket(member) == role)
-            side = 1 - side;
+        if (!member || member == main || !member->IsAlive() || !member->IsInMap(player) ||
+            !PlayerbotAI::IsTank(member))
+            continue;
+
+        if (!main || group->IsAssistant(member->GetGUID()))
+            return member;
+        if (!firstTank)
+            firstTank = member;
     }
-    return {side, false};
+    return firstTank;
+}
+
+Thaddius40::OpeningAssignment AssignForCombat(Player* bot, Fight const& fight)
+{
+    Thaddius40::OpeningAssignment assignment = Thaddius40::AssignOpening(bot);
+    if (!IsTank(bot))
+        return assignment;
+
+    // Zone-wide aggro can list a tank on the far ramp before the tank swap.
+    for (uint8 side = 0; side < fight.adds.size(); ++side)
+    {
+        if (CanAttack(fight.adds[side]) && fight.adds[side]->GetVictim() == bot &&
+            IsOnAddPlatform(*bot, side))
+            return {side, true};
+    }
+
+    uint8 const otherSide = 1 - assignment.side;
+    if (assignment.tank && IsOnAddPlatform(*bot, otherSide))
+    {
+        Creature* assigned = fight.adds[assignment.side];
+        Creature* other = fight.adds[otherSide];
+        if (CanAttack(assigned) && HasTankOnSide(*assigned, assignment.side) && CanAttack(other) &&
+            !HasTankOnSide(*other, otherSide))
+            assignment.side = otherSide;
+    }
+    return assignment;
 }
 
 bool HoldDamage(Unit* target, Fight const& fight)
@@ -260,27 +267,38 @@ private:
 
     bool HandleAdds(Fight const& fight)
     {
-        Assignment const assignment = Assign(bot, fight);
+        Thaddius40::OpeningAssignment const assignment = AssignForCombat(bot, fight);
         Creature* add = fight.adds[assignment.side];
         if (!CanAttack(add))
             return StopDamage(bot);
 
         bool const ranged = PlayerbotAI::IsRanged(bot) || PlayerbotAI::IsHeal(bot);
-        bool const hold = HoldDamage(add, fight) || (!assignment.tank && !IsTank(add->GetVictim()));
+        bool const tankOnSide = HasTankOnSide(*add, assignment.side);
+        bool const hold = HoldDamage(add, fight) || (!assignment.tank && !tankOnSide);
         Unit* victim = bot->GetVictim();
         bool const stopped = (hold || (victim && victim != add)) && StopDamage(bot);
 
         if (assignment.tank)
         {
             Unit* addVictim = add->GetVictim();
-            if (addVictim && addVictim != bot && !IsTank(addVictim) && bot->IsWithinLOSInMap(add))
-                if (char const* taunt = TauntSpell(bot); taunt && botAI->CanCastSpell(taunt, add) &&
-                    botAI->CastSpell(taunt, add))
-                    return true;
-
-            // Establish threat before moving the add to its holding position.
-            if (add->GetVictim() == bot && MoveToPosition(TankPositions[assignment.side], 3.0f))
+            if (addVictim == bot && MoveToPosition(TankPositions[assignment.side], 3.0f))
                 return true;
+            if (addVictim != bot && !tankOnSide)
+            {
+                if (!IsOnAddPlatform(*bot, assignment.side))
+                    return MoveToPosition(TankPositions[assignment.side], 3.0f) || stopped;
+
+                if (addVictim && bot->IsWithinLOSInMap(add))
+                    if (char const* taunt = TauntSpell(bot); taunt && botAI->CanCastSpell(taunt, add) &&
+                        botAI->CastSpell(taunt, add))
+                        return true;
+
+                if (!bot->IsWithinMeleeRange(add))
+                    return MoveNear(add, 1.0f, MovementPriority::MOVEMENT_COMBAT) || stopped;
+                // A tank missing threat must be able to reach and claim the add even during a damage hold.
+                if (bot->GetVictim() != add)
+                    return Attack(add) || stopped;
+            }
         }
         else if (ranged && MoveToPosition(RangedPositions[assignment.side], 4.0f))
             return true;
@@ -397,9 +415,45 @@ public:
         if (target && target != current && bot->IsValidAttackTarget(target))
             return 0.0f;
 
-        return IsTank(bot) || IsTank(current->GetVictim()) ? 1.0f : 0.0f;
+        uint8 const side = current == fight.adds[0] ? 0 : 1;
+        if (!IsOnAddPlatform(*bot, side))
+            return 0.0f;
+        return IsTank(bot) || HasTankOnSide(*fight.adds[side], side) ? 1.0f : 0.0f;
     }
 };
+}
+
+Thaddius40::OpeningAssignment Thaddius40::AssignOpening(Player* player)
+{
+    Group* group = player->GetGroup();
+    if (!group)
+    {
+        uint8 const side = player->GetExactDist2dSq(TankPositions[0]) > player->GetExactDist2dSq(TankPositions[1]);
+        return {side, IsTank(player)};
+    }
+
+    Player* main = EncounterHelpers::GetGroupMainTank(player);
+    if (!main || !main->IsInMap(player))
+        main = FindLocalTank(player, group, nullptr);
+    if (main == player)
+        return {0, true};
+
+    Player* assist = main ? FindLocalTank(player, group, main) : nullptr;
+    if (assist == player)
+        return {1, true};
+
+    // Keep dead members in the order so a death does not shift the rest of their role.
+    OpeningRole const role = RoleBucket(player);
+    uint8 side = role == OpeningRole::Ranged || role == OpeningRole::ReserveTank;
+    for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->GetSource();
+        if (member == player)
+            break;
+        if (member && member != main && member != assist && member->IsInMap(player) && RoleBucket(member) == role)
+            side = 1 - side;
+    }
+    return {side, false};
 }
 
 Thaddius40ActionContext::Thaddius40ActionContext()
