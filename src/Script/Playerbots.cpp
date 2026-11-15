@@ -8,6 +8,7 @@
 #include "BattleGroundTactics.h"
 #include "BattlefieldScript.h"
 #include "Channel.h"
+#include "CharacterPackets.h"
 #include "CheckMountStateAction.h"
 #include "Config.h"
 #include "BuiltInConfig.h"
@@ -19,6 +20,7 @@
 #include "GatherNodeMgr.h"
 #include "GlobalScript.h"
 #include "GuildTaskMgr.h"
+#include "Opcodes.h"
 #include "PlayerScript.h"
 #include "PlayerbotAIConfig.h"
 #include "PlayerbotCommandScript.h"
@@ -452,8 +454,22 @@ public:
     bool CanPacketReceive(WorldSession* session, WorldPacket const& packet) override
     {
         if (Player* player = session->GetPlayer())
+        {
+            // Refuse the AFK logout before the manager can fan it out to the owner's bots.
+            if (packet.GetOpcode() == CMSG_LOGOUT_REQUEST && IsSelfBot(player) && player->isAFK())
+            {
+                LOG_DEBUG("playerbots", "SelfBot {} stays in world: refused the AFK logout", player->GetName());
+
+                WorldPackets::Character::LogoutResponse logoutResponse;
+                logoutResponse.LogoutResult = 2;
+                logoutResponse.Instant = false;
+                session->SendPacket(logoutResponse.Write());
+                return false;
+            }
+
             if (PlayerbotMgr* playerbotMgr = GET_PLAYERBOT_MGR(player))
                 playerbotMgr->HandleMasterIncomingPacket(packet);
+        }
 
         return true;
     }
@@ -629,7 +645,6 @@ public:
 };
 
 void AddPlayerbotsSecureLoginScripts();
-void AddPlayerbotsSelfBotAfkScripts();
 void AddSC_MagtheridonBotScripts();
 void AddSC_SerpentshrineCavernBotScripts();
 void AddSC_TempestKeepBotScripts();
@@ -652,7 +667,6 @@ void AddPlayerbotsScripts()
     new PlayerbotsWorldScript();
     new PlayerBotsBGScript();
     AddPlayerbotsSecureLoginScripts();
-    AddPlayerbotsSelfBotAfkScripts();
     AddPlayerbotsCommandscripts();
     PlayerBotsGuildValidationScript();
     AddSC_MagtheridonBotScripts();
