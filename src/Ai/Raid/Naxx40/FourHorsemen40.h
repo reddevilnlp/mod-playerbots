@@ -12,6 +12,20 @@
 #include "Trigger.h"
 
 class Multiplier;
+class PlayerbotAI;
+
+namespace FourHorsemen40
+{
+    enum class Preparation
+    {
+        Inactive,
+        Staging,
+        Ready
+    };
+
+    Preparation PrepareOpening(PlayerbotAI& leader);
+    Preparation GetOpeningPreparation(PlayerbotAI& member);
+}
 
 class FourHorsemen40ActionContext : public NamedObjectContext<Action>
 {
