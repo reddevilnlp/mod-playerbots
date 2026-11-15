@@ -181,6 +181,7 @@ void RaidNaxxStrategy::InitMultipliers(std::vector<Multiplier*>& multipliers)
         AddRazuvious40Multipliers(botAI, multipliers);
         AddThaddius40Multipliers(botAI, multipliers);
         AddSapphiron40Multipliers(botAI, multipliers);
+        multipliers.push_back(new Maexxna40FlankMultiplier(botAI));
     }
     else
     {

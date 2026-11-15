@@ -19,6 +19,14 @@ public:
     float GetValue(Action* action) override;
 };
 
+class Maexxna40FlankMultiplier final : public Multiplier
+{
+public:
+    explicit Maexxna40FlankMultiplier(PlayerbotAI* botAI) : Multiplier(botAI, "maexxna 40 flank") {}
+
+    float GetValue(Action* action) override;
+};
+
 class HeiganDanceMultiplier : public Multiplier
 {
 public:

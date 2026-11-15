@@ -15,6 +15,7 @@
 #include "HunterActions.h"
 #include "MageActions.h"
 #include "MovementActions.h"
+#include "Naxx40Encounter.h"
 #include "NaxxActions.h"
 #include "NaxxSpellIds.h"
 #include "PaladinActions.h"
@@ -45,6 +46,21 @@ float GrobbulusMultiplier::GetValue(Action* action)
         return 0.0f;
 
     return 1.0f;
+}
+
+float Maexxna40FlankMultiplier::GetValue(Action* action)
+{
+    if (!action || action->getName() != "rear flank" || !IsNaxx40Map(bot->FindMap()) || !bot->IsInCombat())
+        return 1.0f;
+
+    constexpr uint32 Maexxna40Entry = 351006;
+    Unit const* boss = AI_VALUE2(Unit*, "find target", "maexxna");
+    if (!boss || boss->GetEntry() != Maexxna40Entry || !boss->IsAlive() || !boss->IsInCombat())
+        return 1.0f;
+
+    // The stock flank move picks an unverified point on this room's raised floor.
+    // Let melee close normally and keep healers and ranged on their current casting floor.
+    return 0.0f;
 }
 
 float HeiganDanceMultiplier::GetValue(Action* action)
