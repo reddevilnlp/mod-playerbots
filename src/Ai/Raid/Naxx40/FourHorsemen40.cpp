@@ -51,10 +51,12 @@ constexpr char EncounterTrigger[] = "four horsemen 40 active";
 constexpr uint32 Encounter = 12;
 constexpr uint8 CornerCount = 4;
 constexpr uint8 NoCorner = CornerCount;
+constexpr uint8 ZeliekCorner = 3;
 constexpr uint8 NoSupportSlot = 5;
 constexpr uint32 RotationStacks = 2;
 constexpr uint32 SnapshotInterval = 200;
 constexpr uint32 RetryDelay = 5000;
+constexpr uint32 OpeningThreatWindow = 12000;
 constexpr uint32 HandoffWarningAfter = 10000;
 constexpr uint32 ShadowProtectionItem = 13459;
 constexpr uint32 ShadowProtectionAura = 17548;
@@ -129,6 +131,7 @@ std::array<std::array<Position, NoSupportSlot>, 2> const RearSupport = {{
 Position const RoomCenter(2540.0f, -2955.0f, 241.30f);
 Position const WaitingPosition(2535.0f, -2941.0f, 241.48f);
 Position const OpeningCamp(2555.9f, -2996.4f, 241.4f);
+Position const MograinePullPoint(2538.50f, -2970.00f, 241.2943f);
 
 struct OpeningFlank
 {
@@ -144,6 +147,7 @@ std::array<OpeningFlank, 2> const OpeningFlanks = {{
      {{{2550.0f, -2914.0f, 241.28f}, {2532.0f, -2916.0f, 241.28f}}}, {2552.50f, -2940.50f, 241.28f}},
 }};
 constexpr float OpeningArrival = 2.5f;
+constexpr float MograinePullArrival = 0.20f;
 constexpr float OpeningAggroMargin = 5.0f;
 constexpr float OpeningTauntRange = 30.0f;
 constexpr uint8 BothFlanks = 0x3;
@@ -176,6 +180,7 @@ struct OpeningPlan
     uint32 pullRequestedAt = 0;
     uint8 firstTag = NoCorner;
     uint8 readyFlanks = 0;
+    bool mograineReady = false;
     bool pulled = false;
 };
 
@@ -216,6 +221,7 @@ struct RaidPlan
     std::vector<Member> members;
     std::array<ObjectGuid, CornerCount> holders;
     std::array<Rotation, 2> rotations;
+    uint32 combatStartedAt = 0;
     uint32 sampledAt = 0;
     std::array<bool, CornerCount> reached = {};
     bool rearReleased = false;
@@ -239,6 +245,7 @@ struct Assignment
     bool followsReceivingGroup = false;
     bool stagedHealer = false;
     bool stagedTank = false;
+    bool openingThreat = false;
 };
 
 std::mutex PlansMutex;
@@ -543,12 +550,12 @@ void StartOpening(Player& leader, RaidPlan& plan, uint32 now)
     opening.startedAt = opening.lastDrive = now;
     for (Member const& member : plan.members)
     {
-        if (member.home < 2 || member.home >= CornerCount)
+        if (member.home == 0 || member.home >= CornerCount)
             continue;
         if (Player* player = PlayerInRaid(leader, member.guid))
         {
             bool const tank = plan.holders[member.home] == member.guid;
-            if (tank || (PlayerbotAI::IsHeal(player) && member.supportSlot < 2))
+            if (tank || (member.home >= 2 && PlayerbotAI::IsHeal(player) && member.supportSlot < 2))
                 opening.members.push_back({member.guid, member.home, tank ? NoSupportSlot : member.supportSlot});
         }
     }
@@ -761,9 +768,11 @@ bool WalkOpeningLeg(PlayerbotAI& ai, Player& member, Position const& destination
 
 bool PlaceOpeningMember(OpeningMember& moving, Player& member, Bosses const& bosses, uint32 now)
 {
-    OpeningFlank const& flank = OpeningFlanks[moving.corner - 2];
-    Position const& final = moving.healerSlot < 2 ? flank.healers[moving.healerSlot] : flank.pull;
-    if (member.GetExactDist(final) <= OpeningArrival && member.movespline->Finalized())
+    OpeningFlank const* const flank = moving.corner >= 2 ? &OpeningFlanks[moving.corner - 2] : nullptr;
+    Position const& final = !flank ? MograinePullPoint :
+        moving.healerSlot < 2 ? flank->healers[moving.healerSlot] : flank->pull;
+    float const arrival = flank ? OpeningArrival : MograinePullArrival;
+    if (member.GetExactDist(final) <= arrival && member.movespline->Finalized())
         return true;
     PlayerbotAI* ai = GET_PLAYERBOT_AI(&member);
     if (!ai || !ai->CanMove() || member.IsInCombat() ||
@@ -771,10 +780,18 @@ bool PlaceOpeningMember(OpeningMember& moving, Player& member, Bosses const& bos
         (moving.lastMove && now - moving.lastMove < 1200))
         return false;
 
-    std::array<Position const*, 4> const route = {&OpeningCamp, &flank.waypoints[0], &flank.waypoints[1], &final};
+    moving.lastMove = now;
+    if (!flank)
+    {
+        if (!moving.waypoint && member.GetExactDist(OpeningCamp) <= OpeningArrival)
+            ++moving.waypoint;
+        WalkOpeningLeg(*ai, member, moving.waypoint ? final : OpeningCamp, bosses, moving, OpeningAggroMargin);
+        return false;
+    }
+
+    std::array<Position const*, 4> const route = {&OpeningCamp, &flank->waypoints[0], &flank->waypoints[1], &final};
     while (moving.waypoint < route.size() - 1 && member.GetExactDist(*route[moving.waypoint]) <= OpeningArrival)
         ++moving.waypoint;
-    moving.lastMove = now;
     float const margin = moving.corner == 2 && moving.healerSlot == NoSupportSlot && moving.waypoint == route.size() - 1
         ? 2.0f : OpeningAggroMargin;
     WalkOpeningLeg(*ai, member, *route[moving.waypoint], bosses, moving, margin);
@@ -803,10 +820,11 @@ FourHorsemen40::Preparation DriveOpening(Player& leader, RaidPlan& plan, Bosses 
     if (std::any_of(bosses.begin(), bosses.end(), [](Creature const* boss) { return !boss || boss->IsInCombat(); }))
     {
         opening.readyFlanks = 0;
+        opening.mograineReady = false;
         return FourHorsemen40::Preparation::Staging;
     }
     uint8 ready = 0;
-    for (uint8 corner : {uint8(2), uint8(3)})
+    for (uint8 corner : {uint8(1), uint8(2), uint8(3)})
     {
         Player* tank = PlayerInRaid(leader, plan.holders[corner]);
         bool tankReady = false;
@@ -848,6 +866,14 @@ FourHorsemen40::Preparation DriveOpening(Player& leader, RaidPlan& plan, Bosses 
                 }
             }
         }
+        if (corner == 1)
+        {
+            if (tankReady && !opening.mograineReady)
+                LOG_INFO("playerbots", "[Naxx40] Horsemen opening instance={} Mograine ready tank={}",
+                    leader.GetInstanceId(), tank->GetName());
+            opening.mograineReady = tankReady;
+            continue;
+        }
         if (tankReady && healers && healers == arrivedHealers && reachesTank && reachesCorner)
         {
             uint8 const bit = 1u << (corner - 2);
@@ -860,15 +886,16 @@ FourHorsemen40::Preparation DriveOpening(Player& leader, RaidPlan& plan, Bosses 
     if (ready == BothFlanks && opening.readyFlanks != BothFlanks)
         LOG_INFO("playerbots", "[Naxx40] Horsemen opening instance={} both flanks ready", leader.GetInstanceId());
     opening.readyFlanks = ready;
-    if (ready != BothFlanks && (!opening.lastReport || now - opening.lastReport >= 10000))
+    bool const allReady = ready == BothFlanks && opening.mograineReady;
+    if (!allReady && (!opening.lastReport || now - opening.lastReport >= 10000))
     {
         opening.lastReport = now;
         uint32 const arrived = std::count_if(opening.members.begin(), opening.members.end(),
             [](OpeningMember const& member) { return member.arrived; });
-        LOG_INFO("playerbots", "[Naxx40] Horsemen opening instance={} waiting for flanks ({}/{} arrived, readiness {})",
-            leader.GetInstanceId(), arrived, opening.members.size(), ready);
+        LOG_INFO("playerbots", "[Naxx40] Horsemen opening instance={} waiting for groups ({}/{} arrived, flanks {}, Mograine ready={})",
+            leader.GetInstanceId(), arrived, opening.members.size(), ready, opening.mograineReady);
     }
-    return ready == BothFlanks ? FourHorsemen40::Preparation::Ready : FourHorsemen40::Preparation::Staging;
+    return allReady ? FourHorsemen40::Preparation::Ready : FourHorsemen40::Preparation::Staging;
 }
 
 struct OpeningTag
@@ -880,7 +907,7 @@ struct OpeningTag
     uint8 corner;
 };
 
-std::array<uint8, 3> constexpr OpeningTankCorners = {0, 2, 3};
+std::array<uint8, CornerCount> constexpr OpeningTankCorners = {0, 1, 2, 3};
 
 OpeningTag OpeningTagFor(Player& leader, RaidPlan const& plan, Bosses const& bosses, uint8 corner)
 {
@@ -909,6 +936,26 @@ OpeningTag OpeningTagFor(Player& leader, RaidPlan const& plan, Bosses const& bos
     return tag;
 }
 
+bool BuildFeralOpeningThreat(PlayerbotAI& ai, Creature& boss)
+{
+    Player& tank = *ai.GetBot();
+    ShapeshiftForm const form = tank.GetShapeshiftForm();
+    if ((form != FORM_BEAR && form != FORM_DIREBEAR) || !tank.HasSpell(FeralFaerieFire) ||
+        tank.HasSpellCooldown(FeralFaerieFire) || tank.GetExactDist(&boss) > OpeningTauntRange ||
+        !tank.IsWithinLOSInMap(&boss))
+        return false;
+
+    float const before = boss.GetThreatMgr().GetThreat(&tank);
+    if (!ai.CastSpell(FeralFaerieFire, &boss))
+        return false;
+
+    Unit const* victim = boss.GetThreatMgr().GetCurrentVictim();
+    LOG_INFO("playerbots", "[Naxx40] Horsemen opening instance={} {} uses Faerie Fire on {} threat {:.0f}->{:.0f}, victim={}",
+        tank.GetInstanceId(), tank.GetName(), boss.GetName(), before, boss.GetThreatMgr().GetThreat(&tank),
+        victim ? victim->GetName() : "none");
+    return true;
+}
+
 void FinishOpeningTags(Player& leader, RaidPlan& plan, Bosses const& bosses)
 {
     OpeningPlan& opening = *plan.opening;
@@ -932,6 +979,11 @@ void FinishOpeningTags(Player& leader, RaidPlan& plan, Bosses const& bosses)
             leader.GetInstanceId(), tag.tank->GetName(), tag.boss->GetName(), tag.taunt, cast,
             victim ? victim->GetName() : "none");
     }
+
+    // Growl's short fixation needs real threat before the healer threat catches up.
+    OpeningTag const zeliek = OpeningTagFor(leader, plan, bosses, ZeliekCorner);
+    if (first != ZeliekCorner && zeliek.attack == FeralFaerieFire)
+        BuildFeralOpeningThreat(*GET_PLAYERBOT_AI(zeliek.tank), *zeliek.boss);
 }
 
 uint8 AssignedCorner(uint8 home, Rotation const& rotation)
@@ -1540,6 +1592,8 @@ Assignment AssignmentFor(Player& bot, Bosses const& bosses)
     bool const openingPull = plan.opening && !plan.opening->pulled;
     if (plan.group != bot.GetGroup()->GetGUID() || (!openingPull && now - plan.sampledAt > RetryDelay))
         StartPlan(bot, plan);
+    if (!plan.combatStartedAt)
+        plan.combatStartedAt = now;
     if (plan.opening && !plan.opening->pulled)
     {
         FinishOpeningTags(bot, plan, bosses);
@@ -1622,9 +1676,10 @@ Assignment AssignmentFor(Player& bot, Bosses const& bosses)
                 stagedTank = holder && prepared.healerSlot == NoSupportSlot;
                 break;
             }
+    bool const openingThreat = holder && corner == ZeliekCorner && now - plan.combatStartedAt < OpeningThreatWindow;
     return {corner, member->assignedSlot, holder, rotation.handoff, corner >= 2 && !plan.rearReleased,
             plan.holders[AssignedCorner(corner, rotation)], standby, followsReceiving || corner != homeCorner,
-            member->clearingMarks, plan.individualArmed, followsAssigned, stagedHealer, stagedTank};
+            member->clearingMarks, plan.individualArmed, followsAssigned, stagedHealer, stagedTank, openingThreat};
 }
 
 class FourHorsemen40Action final : public AttackAction
@@ -1652,6 +1707,8 @@ public:
         {
             DropAttack();
             fighting = false;
+            if (hazards.EscapeVoidZones(*bot, bot->GetPosition(), VoidEscapeCornerRadius))
+                return true;
             std::array<FourHorsemenMarkSource, CornerCount> sources;
             uint8 count = 0;
             for (uint8 mark = 0; mark < CornerCount; ++mark)
@@ -1684,7 +1741,7 @@ public:
             RearSupport[supportCorner - 2][assignment.supportSlot] : Horsemen[corner].corner;
         Position position = !holder && assignment.opening ? OpeningCamp :
             !standby && pairAlive ? cornerSpot : WaitingPosition;
-        if (assignment.stagedHealer)
+        if (corner >= 2 && assignment.stagedHealer)
             position = OpeningFlanks[corner - 2].healers[assignment.supportSlot];
         if (assignment.standby && assignment.followsReceivingGroup && corner == 3 &&
             !PlayerbotAI::IsHeal(bot) && !PlayerbotAI::IsRangedDps(bot))
@@ -1740,11 +1797,14 @@ public:
             return true;
         }
 
-        if (holder && target && target->GetVictim() != bot)
-        {
-            if (RaidClear::Tanks::Taunt(botAI, target))
-                return true;
+        bool const needsTaunt = holder && target && target->GetVictim() != bot;
+        if (needsTaunt && RaidClear::Tanks::Taunt(botAI, target))
+            return true;
+        if (assignment.openingThreat && target && BuildFeralOpeningThreat(*botAI, *target))
+            return true;
 
+        if (needsTaunt)
+        {
             if (bot->GetExactDist(target) > TauntRange || !bot->IsWithinLOSInMap(target))
             {
                 if (assignment.handoff && bot->GetExactDist(Handoffs[corner / 2]) > CornerArrival)
@@ -1754,8 +1814,10 @@ public:
                     if (WalkTo(Handoffs[corner / 2], true))
                         return true;
                 }
-                if (assignment.stagedTank && WalkTo(OpeningFlanks[corner - 2].pull, true))
+                if (rearHolder && assignment.stagedTank && WalkTo(OpeningFlanks[corner - 2].pull, true))
                     return true;
+                if (rearHolder)
+                    return hazards.ApproachRear(*bot, *target, TauntRange, CornerArrival) || WalkTo(position, true);
                 if (!hazards.IsSafeFromVoidZones(*bot, target->GetPosition()))
                     return WalkTo(position, rearHolder);
                 return MoveNear(target, bot->IsWithinLOSInMap(target) ? TauntRange - 3.0f : 20.0f,
@@ -1864,16 +1926,12 @@ private:
 
     bool WalkTo(Position const& position, bool rearHolder = false)
     {
+        if (rearHolder)
+            return hazards.WalkRear(*bot, position, CornerArrival);
         if (bot->GetExactDist(position) <= CornerArrival || !hazards.IsSafeFromVoidZones(*bot, position))
             return false;
-        if (rearHolder && bot->isMoving() && !bot->movespline->Finalized())
-        {
-            G3D::Vector3 const destination = bot->movespline->FinalDestination();
-            if (position.GetExactDist(destination.x, destination.y, destination.z) <= CornerArrival)
-                return true;
-        }
         return MoveTo(533, position.GetPositionX(), position.GetPositionY(), position.GetPositionZ(),
-            false, false, rearHolder, false, MovementPriority::MOVEMENT_COMBAT);
+            false, false, false, false, MovementPriority::MOVEMENT_COMBAT);
     }
 
     void DropAttack()
@@ -1998,7 +2056,7 @@ FourHorsemen40::Preparation FourHorsemen40::GetOpeningPreparation(PlayerbotAI& a
     auto const& opening = found->second.opening;
     if (!opening || opening->pulled || OpeningExpired(*opening, getMSTime()))
         return Preparation::Inactive;
-    return opening->readyFlanks == BothFlanks ? Preparation::Ready : Preparation::Staging;
+    return opening->readyFlanks == BothFlanks && opening->mograineReady ? Preparation::Ready : Preparation::Staging;
 }
 
 bool FourHorsemen40::PullOpening(PlayerbotAI& ai)
