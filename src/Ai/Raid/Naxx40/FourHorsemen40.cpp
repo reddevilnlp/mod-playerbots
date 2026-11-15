@@ -29,6 +29,7 @@
 #include "SpellMgr.h"
 #include "Strategy.h"
 #include "TankRoles.h"
+#include "ThreatManager.h"
 #include "Timer.h"
 
 #include <algorithm>
@@ -68,6 +69,7 @@ constexpr uint32 DefensiveStance = 71;
 constexpr uint32 BattleStance = 2457;
 constexpr uint32 BerserkerStance = 2458;
 constexpr uint32 Growl = 6795;
+constexpr uint32 FeralFaerieFire = 16857;
 constexpr uint32 BearForm = 5487;
 constexpr uint32 DireBearForm = 9634;
 constexpr uint32 HandOfReckoning = 62124;
@@ -121,14 +123,14 @@ struct OpeningFlank
 {
     std::array<Position, 2> waypoints;
     std::array<Position, 2> healers;
-    Position intercept;
+    Position pull;
 };
 
 std::array<OpeningFlank, 2> const OpeningFlanks = {{
     {{{{2519.0f, -2995.0f, 241.29f}, {2484.0f, -2978.0f, 241.28f}}},
-     {{{2474.0f, -2968.0f, 241.28f}, {2462.0f, -2928.0f, 241.28f}}}, {2489.5f, -2968.0f, 241.28f}},
+     {{{2474.0f, -2968.0f, 241.28f}, {2468.0f, -2935.0f, 241.28f}}}, {2488.50f, -2958.25f, 241.28f}},
     {{{{2561.0f, -2947.0f, 241.28f}, {2550.0f, -2914.0f, 241.28f}}},
-     {{{2550.0f, -2914.0f, 241.28f}, {2538.0f, -2892.0f, 241.28f}}}, {2554.5f, -2940.0f, 241.28f}},
+     {{{2550.0f, -2914.0f, 241.28f}, {2532.0f, -2916.0f, 241.28f}}}, {2552.50f, -2940.50f, 241.28f}},
 }};
 constexpr float OpeningArrival = 2.5f;
 constexpr float OpeningAggroMargin = 5.0f;
@@ -153,6 +155,8 @@ struct OpeningPlan
     std::vector<OpeningMember> members;
     uint32 lastDrive = 0;
     uint32 lastReport = 0;
+    uint32 pullRequestedAt = 0;
+    uint8 firstTag = NoCorner;
     uint8 readyFlanks = 0;
     bool pulled = false;
 };
@@ -426,7 +430,7 @@ void StartOpening(Player& leader, RaidPlan& plan, uint32 now)
 }
 
 bool OutsideOpeningAggro(Player const& member, Bosses const& bosses, G3D::Vector3 const& from,
-    G3D::Vector3 const& to)
+    G3D::Vector3 const& to, float margin)
 {
     G3D::Vector3 const leg(to.x - from.x, to.y - from.y, 0.0f);
     for (Creature const* boss : bosses)
@@ -436,7 +440,7 @@ bool OutsideOpeningAggro(Player const& member, Bosses const& bosses, G3D::Vector
         G3D::Vector3 const towardsBoss(boss->GetPositionX() - from.x, boss->GetPositionY() - from.y, 0.0f);
         float const legSquared = leg.squaredLength();
         float const along = legSquared > 0.0f ? std::clamp(towardsBoss.dot(leg) / legSquared, 0.0f, 1.0f) : 0.0f;
-        float const clearance = boss->GetAggroRange(&member) + OpeningAggroMargin;
+        float const clearance = boss->GetAggroRange(&member) + margin;
         if ((towardsBoss - leg * along).squaredLength() < clearance * clearance)
             return false;
     }
@@ -444,7 +448,7 @@ bool OutsideOpeningAggro(Player const& member, Bosses const& bosses, G3D::Vector
 }
 
 bool WalkOpeningLeg(PlayerbotAI& ai, Player& member, Position const& destination, Bosses const& bosses,
-    OpeningMember& moving)
+    OpeningMember& moving, float margin)
 {
     PathGenerator path(&member);
     path.SetExcludeFlags(NAV_WATER | NAV_MAGMA | NAV_SLIME | NAV_GROUND_STEEP);
@@ -461,7 +465,7 @@ bool WalkOpeningLeg(PlayerbotAI& ai, Player& member, Position const& destination
     {
         G3D::Vector3 const& from = vertices[i - 1];
         G3D::Vector3 const& to = vertices[i];
-        if (to.z < 239.0f || to.z > PlatformExitZ || !OutsideOpeningAggro(member, bosses, from, to) ||
+        if (to.z < 239.0f || to.z > PlatformExitZ || !OutsideOpeningAggro(member, bosses, from, to, margin) ||
             !member.GetMap()->isInLineOfSight(from.x, from.y, from.z + 0.85f, to.x, to.y, to.z + 0.85f,
                 member.GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::Nothing))
             return false;
@@ -488,7 +492,7 @@ bool WalkOpeningLeg(PlayerbotAI& ai, Player& member, Position const& destination
 bool PlaceOpeningMember(OpeningMember& moving, Player& member, Bosses const& bosses, uint32 now)
 {
     OpeningFlank const& flank = OpeningFlanks[moving.corner - 2];
-    Position const& final = moving.healerSlot < 2 ? flank.healers[moving.healerSlot] : Horsemen[moving.corner].corner;
+    Position const& final = moving.healerSlot < 2 ? flank.healers[moving.healerSlot] : flank.pull;
     if (member.GetExactDist(final) <= OpeningArrival && member.movespline->Finalized())
         return true;
     PlayerbotAI* ai = GET_PLAYERBOT_AI(&member);
@@ -501,17 +505,19 @@ bool PlaceOpeningMember(OpeningMember& moving, Player& member, Bosses const& bos
     while (moving.waypoint < route.size() - 1 && member.GetExactDist(*route[moving.waypoint]) <= OpeningArrival)
         ++moving.waypoint;
     moving.lastMove = now;
-    WalkOpeningLeg(*ai, member, *route[moving.waypoint], bosses, moving);
+    float const margin = moving.corner == 2 && moving.healerSlot == NoSupportSlot && moving.waypoint == route.size() - 1
+        ? 2.0f : OpeningAggroMargin;
+    WalkOpeningLeg(*ai, member, *route[moving.waypoint], bosses, moving, margin);
     return false;
 }
 
-bool HealsFromFlank(Player const& healer, Player const& tank, Position const& intercept, bool& reachesIntercept)
+bool HealsFromFlank(Player const& healer, Player const& tank, Position const& corner, bool& reachesCorner)
 {
     if (healer.GetPowerPct(POWER_MANA) < HealerCoverageMana || healer.HasUnitFlag(UNIT_FLAG_SILENCED))
         return false;
-    reachesIntercept |= healer.GetExactDist(intercept) <= HealerCoverageRange &&
+    reachesCorner |= healer.GetExactDist(corner) <= HealerCoverageRange &&
         healer.GetMap()->isInLineOfSight(healer.GetPositionX(), healer.GetPositionY(), healer.GetPositionZ() + 1.5f,
-            intercept.GetPositionX(), intercept.GetPositionY(), intercept.GetPositionZ() + 1.5f,
+            corner.GetPositionX(), corner.GetPositionY(), corner.GetPositionZ() + 1.5f,
             healer.GetPhaseMask(), LINEOFSIGHT_ALL_CHECKS, VMAP::ModelIgnoreFlags::Nothing);
     return healer.IsWithinDistInMap(&tank, HealerCoverageRange) && healer.IsWithinLOSInMap(&tank);
 }
@@ -533,7 +539,7 @@ FourHorsemen40::Preparation DriveOpening(Player& leader, RaidPlan& plan, Bosses 
         uint8 healers = 0;
         uint8 arrivedHealers = 0;
         bool reachesTank = false;
-        bool reachesIntercept = false;
+        bool reachesCorner = false;
         for (OpeningMember& moving : opening.members)
         {
             if (moving.corner != corner)
@@ -548,18 +554,27 @@ FourHorsemen40::Preparation DriveOpening(Player& leader, RaidPlan& plan, Bosses 
                     moving.healerSlot == NoSupportSlot ? "tank" : "healer",
                     member->GetPositionX(), member->GetPositionY(), member->GetPositionZ());
             if (moving.healerSlot == NoSupportSlot)
-                tankReady = moving.arrived && member == tank;
+            {
+                if (moving.arrived && member == tank)
+                {
+                    uint32 const form = RequiredHolderBuff(*tank);
+                    if (form)
+                        GET_PLAYERBOT_AI(tank)->CastSpell(form, tank);
+                    tankReady = !RequiredHolderBuff(*tank) && bosses[corner]->GetExactDist(tank) <= TauntRange &&
+                        tank->IsWithinLOSInMap(bosses[corner]);
+                }
+            }
             else
             {
                 ++healers;
                 if (moving.arrived && tank)
                 {
                     ++arrivedHealers;
-                    reachesTank |= HealsFromFlank(*member, *tank, OpeningFlanks[corner - 2].intercept, reachesIntercept);
+                    reachesTank |= HealsFromFlank(*member, *tank, Horsemen[corner].corner, reachesCorner);
                 }
             }
         }
-        if (tankReady && healers && healers == arrivedHealers && reachesTank && reachesIntercept)
+        if (tankReady && healers && healers == arrivedHealers && reachesTank && reachesCorner)
         {
             uint8 const bit = 1u << (corner - 2);
             ready |= bit;
@@ -580,6 +595,69 @@ FourHorsemen40::Preparation DriveOpening(Player& leader, RaidPlan& plan, Bosses 
             leader.GetInstanceId(), arrived, opening.members.size(), ready);
     }
     return ready == BothFlanks ? FourHorsemen40::Preparation::Ready : FourHorsemen40::Preparation::Staging;
+}
+
+struct OpeningTag
+{
+    Player* tank;
+    Creature* boss;
+    uint32 taunt;
+    uint32 attack;
+    uint8 corner;
+};
+
+std::array<uint8, 3> constexpr OpeningTankCorners = {0, 2, 3};
+
+OpeningTag OpeningTagFor(Player& leader, RaidPlan const& plan, Bosses const& bosses, uint8 corner)
+{
+    OpeningTag tag{PlayerInRaid(leader, plan.holders[corner]), bosses[corner], 0, 0, corner};
+    if (!tag.tank || !tag.boss)
+        return tag;
+    switch (tag.tank->getClass())
+    {
+        case CLASS_WARRIOR:
+            tag.taunt = TauntSpell;
+            break;
+        case CLASS_DRUID:
+            tag.taunt = Growl;
+            tag.attack = FeralFaerieFire;
+            break;
+        case CLASS_PALADIN:
+            tag.taunt = HandOfReckoning;
+            tag.attack = HandOfReckoning;
+            break;
+        case CLASS_DEATH_KNIGHT:
+            tag.taunt = DarkCommand;
+            break;
+        default:
+            break;
+    }
+    return tag;
+}
+
+void FinishOpeningTags(Player& leader, RaidPlan& plan, Bosses const& bosses)
+{
+    OpeningPlan& opening = *plan.opening;
+    if (opening.firstTag == NoCorner)
+        return;
+    uint8 const first = opening.firstTag;
+    opening.firstTag = NoCorner;
+    for (uint8 corner : OpeningTankCorners)
+    {
+        if (corner == first)
+            continue;
+        OpeningTag const tag = OpeningTagFor(leader, plan, bosses, corner);
+        if (!tag.taunt || tag.boss->GetThreatMgr().IsThreatListEmpty())
+            continue;
+        PlayerbotAI* ai = GET_PLAYERBOT_AI(tag.tank);
+        if (tag.boss->GetExactDist(tag.tank) > TauntRange || !tag.tank->IsWithinLOSInMap(tag.boss))
+            continue;
+        bool const cast = ai->CastSpell(tag.taunt, tag.boss);
+        Unit const* victim = tag.boss->GetThreatMgr().GetCurrentVictim();
+        LOG_INFO("playerbots", "[Naxx40] Horsemen opening instance={} {} provokes {} spell={} cast={} threat victim={}",
+            leader.GetInstanceId(), tag.tank->GetName(), tag.boss->GetName(), tag.taunt, cast,
+            victim ? victim->GetName() : "none");
+    }
 }
 
 uint8 AssignedCorner(uint8 home, Rotation const& rotation)
@@ -1186,6 +1264,7 @@ Assignment AssignmentFor(Player& bot, Bosses const& bosses)
         StartPlan(bot, plan);
     if (plan.opening && !plan.opening->pulled)
     {
+        FinishOpeningTags(bot, plan, bosses);
         plan.opening->pulled = true;
         for (OpeningMember const& member : plan.opening->members)
             if (Player* player = PlayerInRaid(bot, member.guid))
@@ -1395,7 +1474,7 @@ public:
                     if (WalkTo(Handoffs[corner / 2], true))
                         return true;
                 }
-                if (assignment.stagedTank && WalkTo(OpeningFlanks[corner - 2].intercept, true))
+                if (assignment.stagedTank && WalkTo(OpeningFlanks[corner - 2].pull, true))
                     return true;
                 if (!hazards.IsSafeFromVoidZones(*bot, target->GetPosition()))
                     return WalkTo(position, rearHolder);
@@ -1640,6 +1719,69 @@ FourHorsemen40::Preparation FourHorsemen40::GetOpeningPreparation(PlayerbotAI& a
     if (!opening || opening->pulled || getMSTime() - opening->lastDrive > RetryDelay)
         return Preparation::Inactive;
     return opening->readyFlanks == BothFlanks ? Preparation::Ready : Preparation::Staging;
+}
+
+bool FourHorsemen40::PullOpening(PlayerbotAI& ai)
+{
+    Player* leader = ai.GetBot();
+    InstanceScript* instance = OpeningInstance(leader);
+    if (!instance)
+        return false;
+
+    std::lock_guard<std::mutex> lock(PlansMutex);
+    auto const found = Plans.find(leader->GetInstanceId());
+    if (found == Plans.end() || found->second.group != leader->GetGroup()->GetGUID())
+        return false;
+    RaidPlan& plan = found->second;
+    if (!plan.opening || plan.opening->leader != leader->GetGUID() || plan.holders[0] != leader->GetGUID())
+        return false;
+    Bosses const bosses = ReadBosses(leader, *instance);
+    uint32 const now = getMSTime();
+    if (DriveOpening(*leader, plan, bosses, now) != Preparation::Ready)
+        return false;
+
+    OpeningPlan& opening = *plan.opening;
+    if (opening.pullRequestedAt && now - opening.pullRequestedAt < 4000)
+        return true;
+    uint32 const form = RequiredHolderBuff(*leader);
+    if (form)
+        return ai.CastSpell(form, leader);
+
+    std::array<OpeningTag, OpeningTankCorners.size()> tags;
+    for (std::size_t i = 0; i < tags.size(); ++i)
+    {
+        OpeningTag& tag = tags[i] = OpeningTagFor(*leader, plan, bosses, OpeningTankCorners[i]);
+        if (!tag.taunt || tag.boss->GetExactDist(tag.tank) > TauntRange || !tag.tank->IsWithinLOSInMap(tag.boss))
+            return false;
+        tag.tank->SetFacingToObject(tag.boss);
+        if (!GET_PLAYERBOT_AI(tag.tank)->CanCastSpell(tag.taunt, tag.boss))
+            return false;
+    }
+
+    // The first damaging spell starts the encounter and initializes threat
+    // on all riders. The other tanks can then taunt on the same map tick.
+    OpeningTag const* first = nullptr;
+    for (OpeningTag const& tag : tags)
+        if (tag.attack && GET_PLAYERBOT_AI(tag.tank)->CanCastSpell(tag.attack, tag.boss) &&
+            (!first || tag.attack == HandOfReckoning))
+            first = &tag;
+    bool cast = false;
+    if (first)
+        cast = GET_PLAYERBOT_AI(first->tank)->CastSpell(first->attack, first->boss);
+    else if (ai.CanCastSpell("shoot", tags[0].boss))
+    {
+        first = &tags[0];
+        cast = ai.CastSpell("shoot", first->boss);
+    }
+    if (!cast)
+        return false;
+    opening.pullRequestedAt = now;
+    opening.firstTag = first->corner;
+    LOG_INFO("playerbots", "[Naxx40] Horsemen opening instance={} {} starts coordinated pull on {}",
+        leader->GetInstanceId(), first->tank->GetName(), first->boss->GetName());
+    if (instance->GetBossState(Encounter) == IN_PROGRESS)
+        FinishOpeningTags(*leader, plan, bosses);
+    return true;
 }
 
 FourHorsemen40ActionContext::FourHorsemen40ActionContext()

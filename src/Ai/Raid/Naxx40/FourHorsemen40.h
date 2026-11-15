@@ -25,6 +25,7 @@ namespace FourHorsemen40
 
     Preparation PrepareOpening(PlayerbotAI& leader);
     Preparation GetOpeningPreparation(PlayerbotAI& member);
+    bool PullOpening(PlayerbotAI& leader);
 }
 
 class FourHorsemen40ActionContext : public NamedObjectContext<Action>
