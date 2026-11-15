@@ -13,6 +13,7 @@
 #include <array>
 #include <cmath>
 #include <optional>
+#include <tuple>
 
 #include "CellImpl.h"
 #include "Creature.h"
@@ -140,9 +141,9 @@ Observation const& Observe(Creature& boss)
             }))
             state.blizzards.push_back({patch->GetPosition(), patch->GetRadius() + BlizzardEdgeMargin});
 
-    state.blocks.clear();
     if (!boss.IsFlying())
     {
+        state.blocks.clear();
         state.liftedAt = 0;
         state.finalBlockAt = 0;
         state.sheltering = false;
@@ -155,7 +156,10 @@ Observation const& Observe(Creature& boss)
     for (auto const& ref : boss.GetMap()->GetPlayers())
     {
         Player const* member = ref.GetSource();
-        if (member && member->IsAlive() && member->HasAura(IceboltAura, boss.GetGUID()))
+        // The native Breath filter keeps these GUIDs until landing and resolves the player
+        // even after they die. Losing the aura must not make the raid leave cover.
+        if (member && member->HasAura(IceboltAura, boss.GetGUID()) &&
+            std::find(state.blocks.begin(), state.blocks.end(), member->GetGUID()) == state.blocks.end())
             state.blocks.push_back(member->GetGUID());
     }
     std::sort(state.blocks.begin(), state.blocks.end());
@@ -352,6 +356,7 @@ std::optional<Position> FindShelter(PlayerbotAI* ai, Player& bot, Creature const
     std::optional<Position> best;
     float bestCost = 0.0f;
     bool bestInBlizzard = true;
+    bool bestChecked = false;
     uint32 const count = static_cast<uint32>(state.blocks.size());
     uint32 const seat = slot / count;
     float const depth = 3.0f + 1.1f * (seat % 5);
@@ -373,12 +378,14 @@ std::optional<Position> FindShelter(PlayerbotAI* ai, Player& bot, Creature const
         // Prefer safe cover even if it uses another block. Slots spread when distances are close.
         bool const inBlizzard = NearBlizzard(destination, state);
         float const cost = bot.GetExactDist2d(destination) + (i == slot % count ? 0.0f : 4.0f);
-        if ((!best || (bestInBlizzard && !inBlizzard) || (bestInBlizzard == inBlizzard && cost < bestCost)) &&
-            CanReachDry(ai, bot, destination))
+        bool const checked = CanReachDry(ai, bot, destination);
+        auto const rank = std::tuple{!checked, inBlizzard, cost};
+        if (!best || rank < std::tuple{!bestChecked, bestInBlizzard, bestCost})
         {
             best = destination;
             bestCost = cost;
             bestInBlizzard = inBlizzard;
+            bestChecked = checked;
         }
     }
     return best;
@@ -405,7 +412,7 @@ public:
         uint32 const slot = static_cast<uint32>(std::clamp(botAI->GetGroupSlotIndex(bot), 0, 39));
         if (boss->IsFlying())
         {
-            if (state.sheltering && !state.blocks.empty())
+            if (state.sheltering)
             {
                 bool const covered = HasCover(*bot, *boss, state);
                 if (covered && !NearBlizzard(*bot, state))
@@ -420,6 +427,8 @@ public:
                     return StopCurrentMove();
                 if (destination)
                     return Move(*destination, MovementPriority::MOVEMENT_FORCED);
+                // With no resolvable anchor, do not disperse during the Breath cast.
+                return StopCurrentMove();
             }
 
             if (auto const escape = EscapeBlizzard(botAI, *bot, *boss, state))
