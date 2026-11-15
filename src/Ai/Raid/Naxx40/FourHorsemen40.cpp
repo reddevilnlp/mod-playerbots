@@ -51,12 +51,17 @@ constexpr char EncounterTrigger[] = "four horsemen 40 active";
 constexpr uint32 Encounter = 12;
 constexpr uint8 CornerCount = 4;
 constexpr uint8 NoCorner = CornerCount;
+constexpr uint8 KorthCorner = 0;
 constexpr uint8 ZeliekCorner = 3;
 constexpr uint8 NoSupportSlot = 5;
 constexpr uint32 RotationStacks = 2;
 constexpr uint32 SnapshotInterval = 200;
 constexpr uint32 RetryDelay = 5000;
 constexpr uint32 OpeningThreatWindow = 12000;
+constexpr uint32 OpeningRearHealingWindow = 45000;
+constexpr uint32 KorthOpeningThreatWindow = 8000;
+constexpr uint32 KorthOpeningShotWait = 900;
+constexpr float KorthOpeningThreatLead = 500.0f;
 constexpr uint32 HandoffWarningAfter = 10000;
 constexpr uint32 ShadowProtectionItem = 13459;
 constexpr uint32 ShadowProtectionAura = 17548;
@@ -81,6 +86,8 @@ constexpr uint8 MinimumMeteorSoak = 5;
 constexpr float RearMarkClearance = 48.0f;
 constexpr float FrontMarkClearance = 58.0f;
 constexpr uint32 TauntSpell = 355;
+constexpr uint32 ShootRangedWeapon = 3018;
+constexpr uint32 Bloodrage = 2687;
 constexpr uint32 DefensiveStance = 71;
 constexpr uint32 BattleStance = 2457;
 constexpr uint32 BerserkerStance = 2458;
@@ -137,6 +144,7 @@ std::array<std::array<Position, NoSupportSlot>, 2> const RearSupport = {{
 Position const RoomCenter(2540.0f, -2955.0f, 241.30f);
 Position const WaitingPosition(2535.0f, -2941.0f, 241.48f);
 Position const OpeningCamp(2555.9f, -2996.4f, 241.4f);
+Position const ZeliekOpeningHealPad(2546.0f, -2902.0f, 241.28f);
 std::array<Position, 2> const FrontSupportPads = {{{2537.5f, -3015.5f, 241.34f}, {2588.0f, -2968.0f, 241.34f}}};
 Position const MograinePullPoint(2538.50f, -2970.00f, 241.2943f);
 
@@ -250,9 +258,10 @@ struct Assignment
     uint8 clearingMarks = 0;
     bool individualArmed = false;
     bool followsReceivingGroup = false;
-    bool stagedHealer = false;
+    std::optional<Position> stagedHealer;
     bool stagedTank = false;
     bool openingThreat = false;
+    uint32 korthOpeningAt = 0;
 };
 
 std::mutex PlansMutex;
@@ -963,6 +972,32 @@ bool BuildFeralOpeningThreat(PlayerbotAI& ai, Creature& boss)
     return true;
 }
 
+void StartKorthOpeningShot(OpeningTag const& tag)
+{
+    if (!tag.tank || !tag.boss || tag.tank->getClass() != CLASS_WARRIOR)
+        return;
+
+    Player& tank = *tag.tank;
+    Creature& boss = *tag.boss;
+    Item const* weapon = tank.GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_RANGED);
+    SpellInfo const* shot = sSpellMgr->GetSpellInfo(ShootRangedWeapon);
+    if (!weapon || !shot)
+        return;
+
+    uint32 const subclass = weapon->GetTemplate()->SubClass;
+    if (subclass != ITEM_SUBCLASS_WEAPON_BOW && subclass != ITEM_SUBCLASS_WEAPON_GUN &&
+        subclass != ITEM_SUBCLASS_WEAPON_CROSSBOW)
+        return;
+    if (tank.IsWithinRange(&boss, tank.GetSpellMinRangeForTarget(&boss, shot) + tank.GetMeleeRange(&boss)) ||
+        !tank.IsWithinCombatRange(&boss, tank.GetSpellMaxRangeForTarget(&boss, shot)) || !tank.IsWithinLOSInMap(&boss))
+        return;
+
+    PlayerbotAI* ai = GET_PLAYERBOT_AI(&tank);
+    if (ai->CanCastSpell(ShootRangedWeapon, &boss, false) && ai->CastSpell(ShootRangedWeapon, &boss))
+        LOG_INFO("playerbots", "[Naxx40] Horsemen opening instance={} {} readies Shoot on {}",
+            tank.GetInstanceId(), tank.GetName(), boss.GetName());
+}
+
 void FinishOpeningTags(Player& leader, RaidPlan& plan, Bosses const& bosses)
 {
     OpeningPlan& opening = *plan.opening;
@@ -987,7 +1022,10 @@ void FinishOpeningTags(Player& leader, RaidPlan& plan, Bosses const& bosses)
             victim ? victim->GetName() : "none");
     }
 
-    // Growl's short fixation needs real threat before the healer threat catches up.
+    // The opening taunts establish first contact. Normal ranged attacks give
+    // the tanks time to build threat before the first healing casts land.
+    if (first != KorthCorner)
+        StartKorthOpeningShot(OpeningTagFor(leader, plan, bosses, KorthCorner));
     OpeningTag const zeliek = OpeningTagFor(leader, plan, bosses, ZeliekCorner);
     if (first != ZeliekCorner && zeliek.attack == FeralFaerieFire)
         BuildFeralOpeningThreat(*GET_PLAYERBOT_AI(zeliek.tank), *zeliek.boss);
@@ -1646,6 +1684,53 @@ void UpdateRotation(Player& bot, RaidPlan& plan, Bosses const& bosses, uint8 fir
         left->GetName(), leftStacks, right->GetName(), rightStacks);
 }
 
+std::optional<Position> RearOpeningHealPosition(Player& healer, RaidPlan const& plan, uint8 corner, uint8 slot)
+{
+    std::size_t const side = corner - 2;
+    if (!plan.rearReleased || !plan.reached[corner])
+        return OpeningFlanks[side].healers[slot];
+
+    Player const* tank = PlayerInRaid(healer, plan.holders[corner]);
+    if (!tank)
+        return {};
+
+    uint8 const otherSlot = slot ^ 1;
+    Player* other = nullptr;
+    for (OpeningMember const& staged : plan.opening->members)
+        if (staged.arrived && staged.corner == corner && staged.healerSlot == otherSlot)
+        {
+            auto const assignment = std::find_if(plan.members.begin(), plan.members.end(),
+                [&staged, corner, otherSlot](Member const& member)
+                {
+                    return member.guid == staged.guid && member.assignedCorner == corner &&
+                        member.assignedSlot == otherSlot && !member.clearingMarks;
+                });
+            if (assignment != plan.members.end())
+                other = PlayerInRaid(healer, staged.guid);
+            break;
+        }
+
+    auto coversTank = [tank](Player const* player)
+    {
+        return player && player->GetPowerPct(POWER_MANA) >= HealerCoverageMana &&
+            !player->HasUnitFlag(UNIT_FLAG_SILENCED) &&
+            player->IsWithinDistInMap(tank, HealerCoverageRange) && player->IsWithinLOSInMap(tank);
+    };
+    auto combatPadFor = [side](uint8 healerSlot) -> Position const&
+    {
+        return side == 1 && healerSlot == 0 ? ZeliekOpeningHealPad : RearSupport[side][healerSlot];
+    };
+    bool const otherCovers = coversTank(other) && !other->isMoving();
+    bool const canHeal = coversTank(&healer);
+    bool const otherSettled = otherCovers && other->GetExactDist(combatPadFor(otherSlot)) <= CornerArrival;
+    if (otherSettled || (slot == 0 && canHeal && otherCovers))
+        return combatPadFor(slot);
+    if (canHeal && healer.GetExactDist(tank) <= HealerCoverageRange - CornerArrival)
+        return healer.GetPosition();
+
+    return combatPadFor(slot);
+}
+
 Assignment AssignmentFor(Player& bot, Bosses const& bosses)
 {
     std::lock_guard<std::mutex> lock(PlansMutex);
@@ -1728,20 +1813,28 @@ Assignment AssignmentFor(Player& bot, Bosses const& bosses)
     uint8 const corner = holder ? homeCorner : standby ? receivingCorner : member->assignedCorner;
     Rotation const& rotation = plan.rotations[corner / 2];
     bool const followsAssigned = (followsReceiving && corner == receivingCorner) || !member->coveringTank.IsEmpty();
-    bool stagedHealer = false;
+    std::optional<Position> stagedHealer;
     bool stagedTank = false;
-    if (plan.opening && corner >= 2 && (!plan.rearReleased || !plan.reached[corner]))
+    if (plan.opening && corner >= 2)
         for (OpeningMember const& prepared : plan.opening->members)
             if (prepared.arrived && prepared.guid == member->guid && prepared.corner == corner)
             {
-                stagedHealer = !holder && prepared.healerSlot < 2 && member->assignedSlot == prepared.healerSlot;
-                stagedTank = holder && prepared.healerSlot == NoSupportSlot;
+                if (!holder && !standby && !member->clearingMarks && prepared.healerSlot < 2 &&
+                    member->assignedSlot == prepared.healerSlot && !rotation.changedAt &&
+                    now - plan.combatStartedAt < OpeningRearHealingWindow)
+                    stagedHealer = RearOpeningHealPosition(bot, plan, corner, prepared.healerSlot);
+                stagedTank = holder && prepared.healerSlot == NoSupportSlot &&
+                    (!plan.rearReleased || !plan.reached[corner]);
                 break;
             }
     bool const openingThreat = holder && corner == ZeliekCorner && now - plan.combatStartedAt < OpeningThreatWindow;
+    uint32 const korthOpeningAt = holder && corner == KorthCorner && bot.getClass() == CLASS_WARRIOR &&
+        plan.opening && plan.opening->pulled && now - plan.combatStartedAt < KorthOpeningThreatWindow ?
+        plan.combatStartedAt : 0;
     return {corner, member->assignedSlot, holder, rotation.handoff, corner >= 2 && !plan.rearReleased,
             plan.holders[AssignedCorner(corner, rotation)], standby, followsReceiving || corner != homeCorner,
-            member->clearingMarks, plan.individualArmed, followsAssigned, stagedHealer, stagedTank, openingThreat};
+            member->clearingMarks, plan.individualArmed, followsAssigned, stagedHealer, stagedTank, openingThreat,
+            korthOpeningAt};
 }
 
 class FourHorsemen40Action final : public AttackAction
@@ -1807,8 +1900,8 @@ public:
             position = FrontHolderPads[corner];
         if (!holder && corner < 2 && !standby && pairAlive)
             position = FrontSupportPosition(corner, bot);
-        if (corner >= 2 && assignment.stagedHealer)
-            position = OpeningFlanks[corner - 2].healers[assignment.supportSlot];
+        if (assignment.stagedHealer)
+            position = *assignment.stagedHealer;
         if (assignment.standby && assignment.followsReceivingGroup && corner == 3 &&
             !PlayerbotAI::IsHeal(bot) && !PlayerbotAI::IsRangedDps(bot))
         {
@@ -1868,6 +1961,8 @@ public:
             return true;
         if (assignment.openingThreat && target && BuildFeralOpeningThreat(*botAI, *target))
             return true;
+        if (assignment.korthOpeningAt && target && BuildKorthOpeningThreat(*target, assignment.korthOpeningAt))
+            return true;
 
         if (needsTaunt)
         {
@@ -1887,6 +1982,16 @@ public:
         if (!holder && (assignment.opening || assignment.stagedHealer))
         {
             DropAttack();
+            if (assignment.stagedHealer && !assignment.opening)
+            {
+                if (bot->GetExactDist(position) <= CornerArrival)
+                {
+                    if (bot->isMoving())
+                        bot->StopMoving();
+                    return false;
+                }
+                return WalkTo(position, true);
+            }
             return WalkTo(position);
         }
 
@@ -1923,6 +2028,47 @@ public:
     bool HoldingRearCorner() const { return holder && corner >= 2 && corner < CornerCount; }
 
 private:
+    bool BuildKorthOpeningThreat(Creature& target, uint32 startedAt)
+    {
+        ThreatManager const& threat = target.GetThreatMgr();
+        float const ownThreat = threat.GetThreat(bot);
+        float nextThreat = 0.0f;
+        for (ThreatReference const* reference : threat.GetUnsortedThreatList())
+            if (reference->IsOnline() && reference->GetVictim() != bot)
+                nextThreat = std::max(nextThreat, reference->GetThreat());
+        if (target.GetVictim() == bot && ownThreat >= nextThreat + KorthOpeningThreatLead)
+            return false;
+
+        bool const meleeRange = bot->IsWithinMeleeRange(&target);
+        if (bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+        {
+            if (!meleeRange && getMSTimeDiff(startedAt, getMSTime()) < KorthOpeningShotWait)
+                return true;
+            bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
+        }
+
+        if (bot->GetPower(POWER_RAGE) < 150 && botAI->CanCastSpell(Bloodrage, bot))
+            botAI->CastSpell(Bloodrage, bot);
+        if (!meleeRange)
+        {
+            float const contactRange = std::max(8.0f, bot->GetMeleeRange(&target));
+            if (hazards.ApproachRear(*bot, target, contactRange, 1.0f))
+                return true;
+        }
+
+        if (bot->GetVictim() != &target)
+            Attack(&target);
+        if (meleeRange)
+            for (char const* ability : {"shield slam", "devastate"})
+                if (botAI->CanCastSpell(ability, &target) && botAI->CastSpell(ability, &target))
+                {
+                    LOG_INFO("playerbots", "[Naxx40] Horsemen opening instance={} {} uses {} on {} threat {:.0f}->{:.0f}",
+                        bot->GetInstanceId(), bot->GetName(), ability, target.GetName(), ownThreat, threat.GetThreat(bot));
+                    break;
+                }
+        return true;
+    }
+
     Position SpacedBlaumeuxPosition(Position const& center, float radius)
     {
         float const angle = float(bot->GetGUID().GetCounter() % 12) * float(M_PI) / 6.0f;
