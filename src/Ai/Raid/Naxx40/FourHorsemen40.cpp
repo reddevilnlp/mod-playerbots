@@ -59,6 +59,7 @@ constexpr uint32 HandoffWarningAfter = 10000;
 constexpr uint32 ShadowProtectionItem = 13459;
 constexpr uint32 ShadowProtectionAura = 17548;
 constexpr uint32 TankSuppliesWaitMs = 20000;
+constexpr uint32 TankFoodWaitMs = 11500;
 constexpr uint32 ShadowProtectionWaitMs = 2500;
 constexpr uint32 ItemRetryMs = 1000;
 constexpr float CornerArrival = 2.0f;
@@ -166,6 +167,7 @@ struct OpeningPlan
     std::vector<OpeningMember> members;
     std::array<uint32, CornerCount> suppliesAttempt{};
     std::array<uint8, CornerCount> suppliesUsed{};
+    std::array<uint32, CornerCount> eatingStarted{};
     uint32 suppliesStarted = 0;
     bool suppliesChecked = false;
     uint32 startedAt = 0;
@@ -570,6 +572,13 @@ public:
     }
 };
 
+bool OpeningExpired(OpeningPlan const& opening, uint32 now)
+{
+    if (opening.suppliesStarted && !opening.suppliesChecked && now - opening.suppliesStarted < TankSuppliesWaitMs)
+        return false;
+    return now - opening.lastDrive > RetryDelay;
+}
+
 bool PrepareTankSupplies(Player& leader, RaidPlan const& plan, OpeningPlan& opening, uint32 now)
 {
     using namespace Patchwerk40TankSupplies;
@@ -598,15 +607,31 @@ bool PrepareTankSupplies(Player& leader, RaidPlan const& plan, OpeningPlan& open
         bool const canFlask = !flask && !(used & FlaskUsed) && tank->HasItemCount(FlaskItem, 1);
         bool const canEat = !food && !(used & FoodUsed) && !tank->HasAura(EatingAura) && tank->HasItemCount(FoodItem, 1);
         uint32 const item = canFlask ? FlaskItem : canEat ? FoodItem : 0;
-        pending |= item || (!food && tank->HasAura(EatingAura));
+        uint32& eating = opening.eatingStarted[corner];
+        if (!food && tank->HasAura(EatingAura) && !eating)
+        {
+            eating = now;
+            GET_PLAYERBOT_AI(tank)->SetActionDuration(TankFoodWaitMs);
+        }
+        pending |= item || (!food && eating && now - eating < TankFoodWaitMs);
         uint32& last = opening.suppliesAttempt[corner];
         if (item && (!last || now - last >= ItemRetryMs))
         {
             last = now;
             uint32 const before = tank->GetItemCount(item);
-            HorsemenTankConsumable(GET_PLAYERBOT_AI(tank)).Use(item);
+            PlayerbotAI* const tankAI = GET_PLAYERBOT_AI(tank);
+            HorsemenTankConsumable(tankAI).Use(item);
             if (tank->GetItemCount(item) < before)
+            {
                 used |= item == FlaskItem ? FlaskUsed : FoodUsed;
+                if (item == FoodItem)
+                {
+                    eating = now;
+                    tankAI->SetActionDuration(TankFoodWaitMs);
+                    LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} {} started tank food (eating aura={})",
+                        leader.GetInstanceId(), tank->GetName(), tank->HasAura(EatingAura));
+                }
+            }
         }
     }
 
@@ -1950,7 +1975,7 @@ FourHorsemen40::Preparation FourHorsemen40::PrepareOpening(PlayerbotAI& ai)
     RaidPlan& plan = Plans[leader->GetInstanceId()];
     uint32 const now = getMSTime();
     if (plan.group != leader->GetGroup()->GetGUID() || !plan.opening || plan.opening->pulled ||
-        plan.opening->leader != leader->GetGUID() || now - plan.opening->lastDrive > RetryDelay)
+        plan.opening->leader != leader->GetGUID() || OpeningExpired(*plan.opening, now))
     {
         if (leader->GetExactDist(OpeningCamp) > 15.0f)
             return Preparation::Inactive;
@@ -1971,7 +1996,7 @@ FourHorsemen40::Preparation FourHorsemen40::GetOpeningPreparation(PlayerbotAI& a
     if (found == Plans.end() || found->second.group != member->GetGroup()->GetGUID())
         return Preparation::Inactive;
     auto const& opening = found->second.opening;
-    if (!opening || opening->pulled || getMSTime() - opening->lastDrive > RetryDelay)
+    if (!opening || opening->pulled || OpeningExpired(*opening, getMSTime()))
         return Preparation::Inactive;
     return opening->readyFlanks == BothFlanks ? Preparation::Ready : Preparation::Staging;
 }
@@ -2086,7 +2111,7 @@ bool FourHorsemen40::SuppressTankWorldBuff(Player& player, uint32 spellId)
     RaidPlan const& plan = found->second;
     OpeningPlan const& opening = *plan.opening;
     if (!opening.suppliesStarted || (state == NOT_STARTED &&
-        (opening.pulled || getMSTimeDiff(opening.lastDrive, getMSTime()) > RetryDelay)))
+        (opening.pulled || OpeningExpired(opening, getMSTime()))))
         return false;
     return std::find(plan.holders.begin(), plan.holders.end(), player.GetGUID()) != plan.holders.end();
 }
@@ -2120,8 +2145,7 @@ bool FourHorsemen40::RestoreWarriorStance(PlayerbotAI& ai)
             if (found != Plans.end() && found->second.opening)
             {
                 OpeningPlan const& opening = *found->second.opening;
-                if (opening.startedAt == saved.openingStartedAt && !opening.pulled &&
-                    getMSTimeDiff(opening.lastDrive, getMSTime()) < RetryDelay)
+                if (opening.startedAt == saved.openingStartedAt && !opening.pulled && !OpeningExpired(opening, getMSTime()))
                     return false;
             }
         }
