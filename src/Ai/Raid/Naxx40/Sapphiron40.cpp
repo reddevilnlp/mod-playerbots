@@ -19,15 +19,19 @@
 #include "DynamicObject.h"
 #include "GameObject.h"
 #include "InstanceScript.h"
+#include "Map.h"
 #include "MotionMaster.h"
 #include "MovementActions.h"
+#include "MoveSpline.h"
 #include "Multiplier.h"
 #include "Naxx40Encounter.h"
 #include "ObjectAccessor.h"
+#include "PathGenerator.h"
 #include "Playerbots.h"
 #include "SpellAuras.h"
 #include "Strategy.h"
 #include "Timer.h"
+#include "Ai/Raid/RaidClear/Common/AggroLeash.h"
 
 namespace
 {
@@ -39,12 +43,14 @@ constexpr uint32 IceBlockEntry = 181247;
 constexpr uint32 IceboltAura = 28522;
 constexpr uint32 ChillAura = 28547;
 constexpr uint32 SnapshotIntervalMs = 200;
-constexpr uint32 GroundRepositionMs = 5500;
 constexpr uint32 IncompleteVolleyMs = 12000;
 constexpr uint32 IceboltTravelMarginMs = 1100;
 constexpr size_t IceboltCount = 3;
 constexpr float ArenaSearchRadius = 75.0f;
 constexpr float BlizzardRadius = 12.0f;
+constexpr float GroundDangerRadius = 35.0f;
+constexpr float GroundFlankStart = 94.0f;
+constexpr float GroundFlankEnd = 116.0f;
 constexpr float CoverWidth = 2.0f;
 constexpr float CoverRange = 10.0f;
 constexpr float Pi = 3.14159265f;
@@ -59,7 +65,6 @@ struct Observation
     ObjectGuid bossGuid;
     uint32 sampledAt = 0;
     uint32 liftedAt = 0;
-    uint32 landedAt = 0;
     uint32 finalBlockAt = 0;
     bool sheltering = false;
     std::vector<ObjectGuid> blocks;
@@ -106,8 +111,6 @@ Observation const& Observe(Creature& boss)
     state.blocks.clear();
     if (!boss.IsFlying())
     {
-        if (state.liftedAt)
-            state.landedAt = now;
         state.liftedAt = 0;
         state.finalBlockAt = 0;
         state.sheltering = false;
@@ -197,6 +200,51 @@ std::optional<Position> EscapeBlizzard(Player const& bot, Creature const& boss, 
             return destination;
     }
     return std::nullopt;
+}
+
+float FlankAngleDegrees(Creature const& boss, Position const& position)
+{
+    return std::remainder(boss.GetAngle(&position) - boss.GetOrientation(), 2.0f * Pi) * 180.0f / Pi;
+}
+
+bool InGroundFlank(Creature const& boss, Position const& position)
+{
+    // Cleave chains through the front half of the boss. Tail Sweep covers the rear 120 degrees.
+    float const angle = std::abs(FlankAngleDegrees(boss, position));
+    return angle >= GroundFlankStart && angle <= GroundFlankEnd;
+}
+
+bool CanReachDry(PlayerbotAI* ai, Player& bot, Position const& destination)
+{
+    PathGenerator path(&bot);
+    constexpr uint32 IncompleteWalk = PATHFIND_INCOMPLETE | PATHFIND_NOPATH | PATHFIND_SHORTCUT |
+                                      PATHFIND_NOT_USING_PATH | PATHFIND_FARFROMPOLY;
+    if (!path.CalculatePath(destination.GetPositionX(), destination.GetPositionY(), destination.GetPositionZ()) ||
+        !(path.GetPathType() & PATHFIND_NORMAL) || (path.GetPathType() & IncompleteWalk) ||
+        path.getPathLength() > 35.0f)
+        return false;
+
+    auto const& end = path.GetActualEndPosition();
+    if (destination.GetExactDistSq(end.x, end.y, end.z) > 1.0f ||
+        RaidClear::Leash::WalkCheck(ai, &bot).Pulls(path.GetPath()))
+        return false;
+
+    auto const& points = path.GetPath();
+    for (std::size_t i = 1; i < points.size(); ++i)
+    {
+        G3D::Vector3 const step = points[i] - points[i - 1];
+        int const samples = std::max(1, static_cast<int>(std::ceil(step.length() / 2.0f)));
+        for (int sample = 1; sample <= samples; ++sample)
+        {
+            G3D::Vector3 const point = points[i - 1] + step * (static_cast<float>(sample) / samples);
+            PositionFullTerrainStatus terrain;
+            bot.GetMap()->GetFullTerrainStatusForPosition(bot.GetPhaseMask(), point.x, point.y, point.z,
+                                                          bot.GetCollisionHeight(), terrain);
+            if (terrain.liquidInfo.Status & MAP_LIQUID_STATUS_IN_CONTACT)
+                return false;
+        }
+    }
+    return points.size() >= 2;
 }
 
 bool HasCover(Player const& bot, Creature const& boss, Observation const& state)
@@ -296,17 +344,45 @@ public:
         if (auto const escape = EscapeBlizzard(*bot, *boss, state))
             return Move(*escape, MovementPriority::MOVEMENT_COMBAT);
 
-        Unit const* victim = boss->GetVictim();
-        if (!state.landedAt || getMSTime() - state.landedAt > GroundRepositionMs || !victim || victim == bot ||
-            PlayerbotAI::IsMainTank(bot))
+        Unit* victim = boss->GetVictim();
+        Player* tank = victim ? victim->ToPlayer() : nullptr;
+        if (!tank || tank == bot || !tank->IsAlive() ||
+            !(PlayerbotAI::IsTank(tank) || PlayerbotAI::IsExplicitMainTank(tank)) ||
+            !boss->IsWithinMeleeRange(tank, 2.0f) || bot->GetExactDist2d(boss) > GroundDangerRadius ||
+            InGroundFlank(*boss, *bot))
             return false;
 
-        float const facing = boss->GetAngle(victim);
-        float const flank = Pi / 2.0f + (static_cast<int32>((slot / 2) % 7) - 3) * 0.1f;
-        float const radius = PlayerbotAI::IsHeal(bot) ? 18.0f : (PlayerbotAI::IsRanged(bot) ? 20.0f : 6.0f);
-        Position const destination = Offset(*boss, facing + (slot % 2 ? flank : -flank), radius);
-        return bot->GetExactDist2dSq(destination) > 4.0f && !NearBlizzard(destination, state) &&
-               Move(destination, MovementPriority::MOVEMENT_COMBAT);
+        if (bot->isMoving() && !bot->movespline->Finalized())
+        {
+            G3D::Vector3 const end = bot->movespline->FinalDestination();
+            Position const destination(end.x, end.y, end.z);
+            if (InGroundFlank(*boss, destination) && !NearBlizzard(destination, state))
+                return true;
+        }
+
+        // Use the actual facing once Sapphiron has reached the tank. Prefer the nearer flank,
+        // then try an alternate offset before crossing to the far side.
+        float const side = FlankAngleDegrees(*boss, *bot) < 0.0f ? -1.0f : 1.0f;
+        bool const healer = PlayerbotAI::IsHeal(bot);
+        bool const ranged = healer || PlayerbotAI::IsRanged(bot);
+        float const radius = ranged ? (healer ? 18.0f : 20.0f) + (slot % 3) * 2.0f : 6.0f;
+        float const offset = static_cast<float>(static_cast<int32>((slot / 3) % 7) - 3);
+        for (float direction : {side, -side})
+        {
+            for (float angle : {105.0f + 2.0f * offset, 113.0f, 97.0f})
+            {
+                Position destination = Offset(*boss, boss->GetOrientation() + direction * angle * Pi / 180.0f, radius);
+                float const ground = bot->GetMapHeight(destination.GetPositionX(), destination.GetPositionY(),
+                                                       destination.GetPositionZ() + 2.0f);
+                if (ground <= INVALID_HEIGHT || std::abs(ground - destination.GetPositionZ()) > 3.0f)
+                    continue;
+                destination.Relocate(destination.GetPositionX(), destination.GetPositionY(), ground);
+                if (!NearBlizzard(destination, state) && CanReachDry(botAI, *bot, destination) &&
+                    Move(destination, MovementPriority::MOVEMENT_COMBAT))
+                    return true;
+            }
+        }
+        return false;
     }
 
 private:
