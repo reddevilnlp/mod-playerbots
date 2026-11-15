@@ -134,6 +134,7 @@ std::array<OpeningFlank, 2> const OpeningFlanks = {{
 }};
 constexpr float OpeningArrival = 2.5f;
 constexpr float OpeningAggroMargin = 5.0f;
+constexpr float OpeningTauntRange = 30.0f;
 constexpr uint8 BothFlanks = 0x3;
 
 using Bosses = std::array<Creature*, CornerCount>;
@@ -560,7 +561,7 @@ FourHorsemen40::Preparation DriveOpening(Player& leader, RaidPlan& plan, Bosses 
                     uint32 const form = RequiredHolderBuff(*tank);
                     if (form)
                         GET_PLAYERBOT_AI(tank)->CastSpell(form, tank);
-                    tankReady = !RequiredHolderBuff(*tank) && bosses[corner]->GetExactDist(tank) <= TauntRange &&
+                    tankReady = !RequiredHolderBuff(*tank) && bosses[corner]->GetExactDist(tank) <= OpeningTauntRange &&
                         tank->IsWithinLOSInMap(bosses[corner]);
                 }
             }
@@ -650,7 +651,7 @@ void FinishOpeningTags(Player& leader, RaidPlan& plan, Bosses const& bosses)
         if (!tag.taunt || tag.boss->GetThreatMgr().IsThreatListEmpty())
             continue;
         PlayerbotAI* ai = GET_PLAYERBOT_AI(tag.tank);
-        if (tag.boss->GetExactDist(tag.tank) > TauntRange || !tag.tank->IsWithinLOSInMap(tag.boss))
+        if (tag.boss->GetExactDist(tag.tank) > OpeningTauntRange || !tag.tank->IsWithinLOSInMap(tag.boss))
             continue;
         bool const cast = ai->CastSpell(tag.taunt, tag.boss);
         Unit const* victim = tag.boss->GetThreatMgr().GetCurrentVictim();
@@ -1743,19 +1744,34 @@ bool FourHorsemen40::PullOpening(PlayerbotAI& ai)
     OpeningPlan& opening = *plan.opening;
     if (opening.pullRequestedAt && now - opening.pullRequestedAt < 4000)
         return true;
+    auto wait = [&](Player const& tank, char const* reason, float distance = 0.0f)
+    {
+        if (!opening.lastReport || now - opening.lastReport >= 5000)
+        {
+            opening.lastReport = now;
+            LOG_INFO("playerbots", "[Naxx40] Horsemen opening instance={} waiting for {}: {} ({:.1f}yd)",
+                leader->GetInstanceId(), tank.GetName(), reason, distance);
+        }
+        return false;
+    };
     uint32 const form = RequiredHolderBuff(*leader);
     if (form)
-        return ai.CastSpell(form, leader);
+        return ai.CastSpell(form, leader) || wait(*leader, "tank form unavailable");
 
     std::array<OpeningTag, OpeningTankCorners.size()> tags;
     for (std::size_t i = 0; i < tags.size(); ++i)
     {
         OpeningTag& tag = tags[i] = OpeningTagFor(*leader, plan, bosses, OpeningTankCorners[i]);
-        if (!tag.taunt || tag.boss->GetExactDist(tag.tank) > TauntRange || !tag.tank->IsWithinLOSInMap(tag.boss))
-            return false;
+        if (!tag.taunt)
+            return wait(*leader, "opening tank or taunt missing");
+        float const distance = tag.boss->GetExactDist(tag.tank);
+        if (distance > OpeningTauntRange || !tag.tank->IsWithinLOSInMap(tag.boss))
+            return wait(*tag.tank, "taunt position", distance);
+        // A reactive taunt may depend on combat threat, which this pull creates.
+        if (!tag.tank->HasSpell(tag.taunt) || tag.tank->HasSpellCooldown(tag.taunt) ||
+            !GET_PLAYERBOT_AI(tag.tank)->CanMove())
+            return wait(*tag.tank, "taunt unavailable", distance);
         tag.tank->SetFacingToObject(tag.boss);
-        if (!GET_PLAYERBOT_AI(tag.tank)->CanCastSpell(tag.taunt, tag.boss))
-            return false;
     }
 
     // The first damaging spell starts the encounter and initializes threat
@@ -1774,7 +1790,7 @@ bool FourHorsemen40::PullOpening(PlayerbotAI& ai)
         cast = ai.CastSpell("shoot", first->boss);
     }
     if (!cast)
-        return false;
+        return wait(first ? *first->tank : *leader, "damaging opener unavailable");
     opening.pullRequestedAt = now;
     opening.firstTag = first->corner;
     LOG_INFO("playerbots", "[Naxx40] Horsemen opening instance={} {} starts coordinated pull on {}",
