@@ -5,6 +5,7 @@
  */
 
 #include "PetsAction.h"
+#include "Ai/Raid/Naxx40/MilitaryTrash40.h"
 #include "CharmInfo.h"
 #include "Creature.h"
 #include "CreatureAI.h"
@@ -418,7 +419,7 @@ bool PetAttackAction::Execute(Event /*event*/)
     if (!target)
         return false;
 
-    if (!bot->IsValidAttackTarget(target))
+    if (!bot->IsValidAttackTarget(target) || !MayPetAttackNaxx40MilitaryTrash(*bot, *target))
         return false;
 
     // This section has been commented because it was overriding the

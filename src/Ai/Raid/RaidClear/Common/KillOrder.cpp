@@ -7,6 +7,8 @@
 #include "KillOrder.h"
 
 #include "RaidClearConfig.h"
+#include "Ai/Raid/Naxx40/MilitaryTrash40.h"
+#include "Ai/Raid/Naxx40/Naxx40Encounter.h"
 #include "Raids/AhnQiraj/AqRaidClear.h"
 #include "Raids/BlackwingLair/BwlRaidClear.h"
 #include "Raids/MoltenCore/McRaidClear.h"
@@ -23,6 +25,13 @@ namespace RaidClear
     namespace
     {
         constexpr uint8 RANK_NONE = 255;
+
+        std::vector<KillOrderEntry> const& KillOrderForBot(Player const& bot)
+        {
+            static std::vector<KillOrderEntry> const militaryTrash = {
+                {Naxx40ShadeOfNaxxramas, 0}, {Naxx40DeathknightCaptain, 1}};
+            return IsNaxx40Map(bot.FindMap()) ? militaryTrash : RaidClear::KillOrderFor(bot.GetMapId());
+        }
 
         uint8 RankOf(Unit const* unit, std::vector<KillOrderEntry> const& table)
         {
@@ -148,7 +157,7 @@ bool RcKillOrderTrigger::IsActive()
     if (!GetConfig().killOrder || !bot->IsInCombat())
         return false;
 
-    std::vector<KillOrderEntry> const& table = KillOrderFor(bot->GetMapId());
+    std::vector<KillOrderEntry> const& table = KillOrderForBot(*bot);
     if (table.empty() || KillOrderMarker(bot->GetGroup()) != bot || KillOrderSuspended(bot))
         return false;
 
@@ -164,7 +173,7 @@ bool RcMarkKillOrderAction::Execute(Event /*event*/)
 
     bool clearSkull = false;
     Unit* target = PickKillOrderTarget(botAI, bot, AI_VALUE(GuidVector, "attackers"),
-                                       KillOrderFor(bot->GetMapId()), &clearSkull);
+                                       KillOrderForBot(*bot), &clearSkull);
     if (!target && !clearSkull)
         return false;
 

@@ -20,6 +20,7 @@
 #include "MCTriggerContext.h"
 #include "MagTriggerContext.h"
 #include "Naxx40Slime.h"
+#include "MilitaryTrash40.h"
 #include "NaxxTriggerContext.h"
 #include "OSTriggerContext.h"
 #include "OnyTriggerContext.h"
@@ -54,6 +55,7 @@ void AiObjectContext::BuildSharedTriggerContexts(
     triggerContexts.Add(new RaidMagtheridonTriggerContext());
     triggerContexts.Add(new RaidNaxxTriggerContext());
     triggerContexts.Add(new Naxx40SlimeTriggerContext());
+    triggerContexts.Add(new Naxx40MilitaryTriggerContext());
     triggerContexts.Add(new Patchwerk40TriggerContext());
     triggerContexts.Add(new Gluth40TriggerContext());
     triggerContexts.Add(new Grobbulus40TriggerContext());

@@ -6,6 +6,7 @@
 
 #include "AggroLeash.h"
 
+#include "Ai/Raid/Naxx40/MilitaryTrash40.h"
 #include "RaidClearConfig.h"
 #include "RaidClearRegistry.h"
 #include "Common/Knockback.h"
@@ -787,6 +788,18 @@ public:
             Unit* victim = pet->GetVictim();
             if (victim && !victim->IsAlive())
                 victim = nullptr;
+            if (victim && !MayPetAttackNaxx40MilitaryTrash(*owner, *victim))
+            {
+                pet->AttackStop();
+                pet->InterruptNonMeleeSpells(false);
+                if (CharmInfo* charm = pet->GetCharmInfo())
+                {
+                    charm->SetIsCommandAttack(false);
+                    charm->SetIsCommandFollow(true);
+                }
+                pet->GetMotionMaster()->MoveFollow(owner, PET_FOLLOW_DIST, pet->GetFollowAngle());
+                continue;
+            }
 
             if (pet->movespline->Finalized())
             {
@@ -846,7 +859,9 @@ public:
             watch.judgedMs = now ? now : 1;
 
             BotTargets targets;
-            targets.victim = victim;
+            // Adjacent military packs can overlap. A pet may reach its engaged target
+            // only if its path still avoids every idle pack.
+            targets.victim = victim && !IsNaxx40MilitaryTrash(*victim) ? victim : nullptr;
             float const buffer = fighting ? config.aggroLeashBuffer : PET_IDLE_BUFFER;
             if (WalkPulls(pet, IdleMobsNear(pet, state, targets, buffer, fighting), targets, buffer))
             {
@@ -903,6 +918,13 @@ public:
         if (!info || info->IsPositive())
             return;
 
+        Unit* target = spell->m_targets.GetUnitTarget();
+        if (target && !MayPetAttackNaxx40MilitaryTrash(*owner, *target))
+        {
+            res = SPELL_FAILED_DONT_REPORT;
+            return;
+        }
+
         if (IsTaunt(info))
         {
             if (RaidHasTank(owner))
@@ -915,7 +937,6 @@ public:
         Splash::Reach const reach = Splash::ReachOfSpell(owner, info);
         if (reach.aroundCaster <= 0.0f && reach.aroundTarget <= 0.0f)
             return;
-        Unit* target = spell->m_targets.GetUnitTarget();
         if (target == pet)
             target = nullptr;
         // A pull: the target's own pack comes along whatever it is hit with.

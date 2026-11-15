@@ -35,6 +35,7 @@
 #include "MoveSplineInit.h"
 #include "Naxx40Encounter.h"
 #include "Naxx40Slime.h"
+#include "MilitaryTrash40.h"
 #include "NewRpgStrategy.h"
 #include "ObjectGuid.h"
 #include "ObjectMgr.h"
@@ -1958,7 +1959,8 @@ void PlayerbotAI::ApplyInstanceStrategies(uint32 mapId, bool tellMaster)
     static const std::vector<std::string> allInstanceStrategies =
     {
         "aq20", "aq40 cthun", "blacktemple", "bwl", "gruulslair", "hyjal", "icc", "karazhan", "magtheridon",
-        "moltencore", "naxx", "naxx40 grobbulus", Naxx40SlimeStrategyName, "onyxia", "rs", "ssc", "tbc-ac",
+        "moltencore", "naxx", "naxx40 grobbulus", Naxx40SlimeStrategyName, Naxx40MilitaryTrashStrategyName,
+        "onyxia", "rs", "ssc", "tbc-ac",
         "tbc-mech", "tbc-mgt", "tbc-ramp",
         "tbc-seth", "tbc-ub", "tempestkeep", "ulduar", "vanilla-sm", "voa", "wotlk-an", "wotlk-cos",
         "wotlk-dtk", "wotlk-eoe", "wotlk-fos", "wotlk-gd", "wotlk-hol", "wotlk-hos", "wotlk-nex",
@@ -2126,6 +2128,8 @@ void PlayerbotAI::ApplyInstanceStrategies(uint32 mapId, bool tellMaster)
         engines[BOT_STATE_NON_COMBAT]->addStrategy("naxx40 grobbulus");
         engines[BOT_STATE_COMBAT]->addStrategy(Naxx40SlimeStrategyName);
         engines[BOT_STATE_NON_COMBAT]->addStrategy(Naxx40SlimeStrategyName);
+        engines[BOT_STATE_COMBAT]->addStrategy(Naxx40MilitaryTrashStrategyName);
+        engines[BOT_STATE_NON_COMBAT]->addStrategy(Naxx40MilitaryTrashStrategyName);
     }
 
     if (tellMaster && !strategyName.empty())
