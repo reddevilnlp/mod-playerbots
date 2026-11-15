@@ -5,6 +5,7 @@
  */
 
 #include "FourHorsemen40.h"
+#include "FourHorsemen40Hazards.h"
 
 #include "AttackAction.h"
 #include "BossLookup.h"
@@ -40,8 +41,23 @@ constexpr uint32 RetryDelay = 5000;
 constexpr uint32 HandoffWarningAfter = 10000;
 constexpr float CornerArrival = 2.0f;
 constexpr float BossCornerRange = 9.0f;
-constexpr float AttackRange = 24.0f;
+constexpr float AttackRange = 28.0f;
 constexpr float TauntRange = 29.0f;
+constexpr float PlatformExitZ = 243.5f;
+constexpr float VoidEscapeCornerRadius = 6.0f;
+constexpr uint32 TauntSpell = 355;
+constexpr uint32 DefensiveStance = 71;
+constexpr uint32 BattleStance = 2457;
+constexpr uint32 BerserkerStance = 2458;
+constexpr uint32 Growl = 6795;
+constexpr uint32 BearForm = 5487;
+constexpr uint32 DireBearForm = 9634;
+constexpr uint32 HandOfReckoning = 62124;
+constexpr uint32 RighteousFury = 25780;
+constexpr uint32 DarkCommand = 56222;
+constexpr uint32 FrostPresence = 48263;
+constexpr uint32 BloodPresence = 48266;
+constexpr uint32 UnholyPresence = 48265;
 
 struct Horseman
 {
@@ -62,8 +78,17 @@ std::array<Horseman, CornerCount> const Horsemen = {{
 }};
 
 std::array<Position, 2> const Handoffs = {{{2563.0f, -2993.0f, 241.41f}, {2494.0f, -2920.0f, 241.28f}}};
+// Each spot is 19 yards from the holder. Pairwise separation is at least 19
+// yards, with clear sight to the holder and no Holy Wrath chain from a settled group.
+std::array<std::array<Position, 4>, 2> const RearSupport = {{
+    {{{2459.90f, -2931.15f, 241.28f}, {2469.40f, -2966.60f, 241.28f},
+      {2488.40f, -2947.60f, 241.28f}, {2478.90f, -2931.15f, 241.28f}}},
+    {{{2501.35f, -2887.10f, 241.28f}, {2536.80f, -2896.60f, 241.28f},
+      {2501.35f, -2906.10f, 241.28f}, {2527.30f, -2913.05f, 241.28f}}},
+}};
 Position const RoomCenter(2540.0f, -2955.0f, 241.30f);
 Position const WaitingPosition(2535.0f, -2941.0f, 241.48f);
+Position const OpeningCamp(2555.9f, -2996.4f, 241.4f);
 
 using Bosses = std::array<Creature*, CornerCount>;
 
@@ -71,6 +96,7 @@ struct Member
 {
     ObjectGuid guid;
     uint8 home;
+    uint8 supportSlot = 4;
 };
 
 struct Rotation
@@ -89,13 +115,16 @@ struct RaidPlan
     std::array<Rotation, 2> rotations;
     uint32 sampledAt = 0;
     std::array<bool, CornerCount> reached = {};
+    bool rearReleased = false;
 };
 
 struct Assignment
 {
     uint8 corner = NoCorner;
+    uint8 supportSlot = 4;
     bool holder = false;
     bool handoff = false;
+    bool opening = false;
     ObjectGuid targetHolder;
 };
 
@@ -142,12 +171,35 @@ bool CanHold(Player* player)
     switch (player->getClass())
     {
         case CLASS_WARRIOR:
+            return player->HasSpell(TauntSpell) && player->HasSpell(DefensiveStance);
         case CLASS_PALADIN:
+            return player->HasSpell(HandOfReckoning);
         case CLASS_DRUID:
+            return player->HasSpell(Growl) && (player->HasSpell(DireBearForm) || player->HasSpell(BearForm));
         case CLASS_DEATH_KNIGHT:
-            return true;
+            return player->HasSpell(DarkCommand);
         default:
             return false;
+    }
+}
+
+uint32 RequiredHolderBuff(Player const& player)
+{
+    ShapeshiftForm const form = player.GetShapeshiftForm();
+    switch (player.getClass())
+    {
+        case CLASS_WARRIOR:
+            return form == FORM_DEFENSIVESTANCE ? 0 : DefensiveStance;
+        case CLASS_DRUID:
+            if (form == FORM_BEAR || form == FORM_DIREBEAR)
+                return 0;
+            return player.HasSpell(DireBearForm) ? DireBearForm : BearForm;
+        case CLASS_PALADIN:
+            return player.HasSpell(RighteousFury) && !player.HasAura(RighteousFury) ? RighteousFury : 0;
+        case CLASS_DEATH_KNIGHT:
+            return player.HasSpell(FrostPresence) && !player.HasAura(FrostPresence) ? FrostPresence : 0;
+        default:
+            return 0;
     }
 }
 
@@ -161,7 +213,7 @@ void SelectHolders(Player& bot, RaidPlan& plan)
 {
     std::vector<Player*> candidates;
     for (Member const& member : plan.members)
-        if (Player* player = PlayerInRaid(bot, member.guid); player && (IsTank(player) || CanHold(player)))
+        if (Player* player = PlayerInRaid(bot, member.guid); player && CanHold(player))
             candidates.push_back(player);
 
     Group* group = bot.GetGroup();
@@ -173,6 +225,16 @@ void SelectHolders(Player& bot, RaidPlan& plan)
         };
         if (priority(lhs) != priority(rhs))
             return priority(lhs) < priority(rhs);
+        if (!IsTank(lhs) && !IsTank(rhs))
+        {
+            auto reservePriority = [](Player* p)
+            {
+                // Bear form supplies armor and stamina even when a melee reserve has no shield.
+                return (IsSelfBot(p) ? 2 : 0) + (p->getClass() == CLASS_DRUID ? 0 : 1);
+            };
+            if (reservePriority(lhs) != reservePriority(rhs))
+                return reservePriority(lhs) < reservePriority(rhs);
+        }
         if (lhs->GetMaxHealth() != rhs->GetMaxHealth())
             return lhs->GetMaxHealth() > rhs->GetMaxHealth();
         return lhs->GetGUID() < rhs->GetGUID();
@@ -222,12 +284,16 @@ void StartPlan(Player& bot, RaidPlan& plan)
             if (PlayerbotAI::IsHeal(player))
             {
                 uint8 const index = counts[0]++;
-                member.home = index < 2 ? 2 + index : index % 2;
+                member.home = index < 4 ? 2 + (index % 2) : index % 2;
+                if (member.home >= 2)
+                    member.supportSlot = index / 2;
             }
             else if (PlayerbotAI::IsRangedDps(player))
             {
                 uint8 const index = counts[1]++;
                 member.home = index < 4 ? 2 + (index % 2) : (index % 3 == 0);
+                if (member.home >= 2)
+                    member.supportSlot = 2 + index / 2;
             }
             else
                 member.home = counts[2]++ % 3 == 2;
@@ -328,6 +394,17 @@ Assignment AssignmentFor(Player& bot, Bosses const& bosses)
     {
         plan.sampledAt = now;
         SelectHolders(bot, plan);
+        if (!plan.rearReleased)
+        {
+            bool ownedBelowPlatform = true;
+            for (uint8 i = 0; i < CornerCount; ++i)
+                ownedBelowPlatform &= OwnsTarget(bosses[i], plan.holders[i]) &&
+                    (!bosses[i] || bosses[i]->GetPositionZ() <= PlatformExitZ);
+            plan.rearReleased = ownedBelowPlatform;
+            if (plan.rearReleased)
+                LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} platform clear, releasing rear support",
+                    bot.GetInstanceId());
+        }
         UpdateRotation(bot, plan, bosses, 0, now);
         UpdateRotation(bot, plan, bosses, 2, now);
         for (uint8 corner = 0; corner < CornerCount; ++corner)
@@ -347,14 +424,16 @@ Assignment AssignmentFor(Player& bot, Bosses const& bosses)
         return {};
 
     Rotation const& rotation = plan.rotations[member->home / 2];
-    return {AssignedCorner(member->home, rotation), plan.holders[member->home] == bot.GetGUID(), rotation.handoff,
+    uint8 const corner = AssignedCorner(member->home, rotation);
+    return {corner, member->supportSlot, plan.holders[member->home] == bot.GetGUID(), rotation.handoff,
+            corner >= 2 && !plan.rearReleased,
             plan.holders[member->home]};
 }
 
 class FourHorsemen40Action final : public AttackAction
 {
 public:
-    explicit FourHorsemen40Action(PlayerbotAI* ai) : AttackAction(ai, TacticsAction) {}
+    explicit FourHorsemen40Action(PlayerbotAI* ai) : AttackAction(ai, TacticsAction), hazards(ai) {}
 
     bool Execute(Event /*event*/) override
     {
@@ -371,8 +450,23 @@ public:
 
         Creature* target = bosses[corner];
         bool const pairAlive = target || bosses[corner ^ 1];
-        Position const& position = pairAlive ? Horsemen[corner].corner : WaitingPosition;
+        uint8 const supportCorner = assignment.handoff ? corner ^ 1 : corner;
+        Position const& cornerSpot = !holder && corner >= 2 && assignment.supportSlot < RearSupport[0].size() ?
+            RearSupport[supportCorner - 2][assignment.supportSlot] : Horsemen[corner].corner;
+        Position const& position = !holder && assignment.opening ? OpeningCamp :
+            pairAlive ? cornerSpot : WaitingPosition;
         fighting = holder || (target && !assignment.handoff && AtCorner(target, corner) && OwnsTarget(target, assignment.targetHolder));
+
+        if (hazards.EscapeVoidZones(*bot, position, VoidEscapeCornerRadius))
+            return true;
+
+        uint32 const holderBuff = holder && target ? RequiredHolderBuff(*bot) : 0;
+        if (holderBuff && holderBuff != RighteousFury && holderBuff != FrostPresence && botAI->CastSpell(holderBuff, bot))
+        {
+            LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} {} prepares for {} with spell {}",
+                bot->GetInstanceId(), bot->GetName(), Horsemen[corner].name, holderBuff);
+            return true;
+        }
 
         if (holder && target && target->GetVictim() != bot)
         {
@@ -383,12 +477,23 @@ public:
             {
                 if (assignment.handoff && bot->GetExactDist(Handoffs[corner / 2]) > CornerArrival)
                     return WalkTo(Handoffs[corner / 2]);
+                if (!hazards.IsSafeFromVoidZones(*bot, target->GetPosition()))
+                    return WalkTo(position);
                 return MoveNear(target, bot->IsWithinLOSInMap(target) ? TauntRange - 3.0f : 20.0f,
                     MovementPriority::MOVEMENT_COMBAT);
             }
 
             return AI_VALUE(Unit*, "current target") != target && Attack(target);
         }
+
+        if (!holder && assignment.opening)
+        {
+            DropAttack();
+            return WalkTo(position);
+        }
+
+        if (holderBuff && (holderBuff == RighteousFury || holderBuff == FrostPresence) && botAI->CastSpell(holderBuff, bot))
+            return true;
 
         if (assignment.handoff && holder)
             return WalkTo(Handoffs[corner / 2]);
@@ -399,13 +504,15 @@ public:
             return WalkTo(position);
         }
 
-        if (bot->GetExactDist(position) > CornerArrival)
-            return WalkTo(position);
+        if (WalkTo(position))
+            return true;
         if (PlayerbotAI::IsHeal(bot))
             return false;
 
         if (target->GetExactDist(bot) <= AttackRange && AI_VALUE(Unit*, "current target") != target)
             return Attack(target);
+        if (holder && bot->getClass() == CLASS_DRUID && bot->IsWithinMeleeRange(target))
+            return botAI->CastSpell("mangle (bear)", target) || botAI->CastSpell("maul", target);
         return false;
     }
 
@@ -414,10 +521,12 @@ public:
         return corner != NoCorner && fighting && target && target->GetEntry() == Horsemen[corner].entry;
     }
 
+    bool HoldingCorner() const { return holder; }
+
 private:
     bool WalkTo(Position const& position)
     {
-        if (bot->GetExactDist(position) <= CornerArrival)
+        if (bot->GetExactDist(position) <= CornerArrival || !hazards.IsSafeFromVoidZones(*bot, position))
             return false;
         return MoveTo(533, position.GetPositionX(), position.GetPositionY(), position.GetPositionZ(),
             false, false, false, false, MovementPriority::MOVEMENT_COMBAT);
@@ -434,6 +543,7 @@ private:
     uint8 corner = NoCorner;
     bool holder = false;
     bool fighting = false;
+    FourHorsemen40Hazards hazards;
 };
 
 class FourHorsemen40Trigger final : public Trigger
@@ -479,10 +589,20 @@ public:
         auto* cast = dynamic_cast<CastSpellAction*>(action);
         SpellInfo const* spell = cast ?
             sSpellMgr->GetSpellInfo(AI_VALUE2(uint32, "spell id", cast->getSpell())) : nullptr;
+        auto* tactics = dynamic_cast<FourHorsemen40Action*>(context->GetAction(TacticsAction));
+        if (tactics && tactics->HoldingCorner() && spell)
+        {
+            if (spell->Id == BattleStance || spell->Id == BerserkerStance ||
+                spell->Id == BloodPresence || spell->Id == UnholyPresence)
+                return 0.0f;
+            if (bot->getClass() == CLASS_DRUID && spell->HasAura(SPELL_AURA_MOD_SHAPESHIFT) &&
+                spell->Id != BearForm && spell->Id != DireBearForm)
+                return 0.0f;
+        }
+
         if (!melee && !(target && bot->IsValidAttackTarget(target)) && !(spell && !spell->IsPositive()))
             return 1.0f;
 
-        auto* tactics = dynamic_cast<FourHorsemen40Action*>(context->GetAction(TacticsAction));
         if (!target || !bot->IsValidAttackTarget(target))
             target = AI_VALUE(Unit*, "current target");
         return tactics && tactics->AllowsOffense(target) ? 1.0f : 0.0f;
