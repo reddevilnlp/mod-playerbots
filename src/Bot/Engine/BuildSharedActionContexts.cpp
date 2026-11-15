@@ -12,6 +12,7 @@
 #include "BWLActionContext.h"
 #include "ChatActionContext.h"
 #include "EoEActionContext.h"
+#include "FourHorsemen40.h"
 #include "Gluth40.h"
 #include "Grobbulus40.h"
 #include "GruulActionContext.h"
@@ -62,6 +63,7 @@ void AiObjectContext::BuildSharedActionContexts(
     actionContexts.Add(new Naxx40SlimeActionContext());
     actionContexts.Add(new Naxx40MilitaryActionContext());
     actionContexts.Add(new Patchwerk40ActionContext());
+    actionContexts.Add(new FourHorsemen40ActionContext());
     actionContexts.Add(new Gluth40ActionContext());
     actionContexts.Add(new Grobbulus40ActionContext());
     actionContexts.Add(new Sapphiron40ActionContext());

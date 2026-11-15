@@ -6,6 +6,7 @@
 
 #include "NaxxStrategy.h"
 
+#include "FourHorsemen40.h"
 #include "Gluth40.h"
 #include "Naxx40Encounter.h"
 #include "NaxxMultipliers.h"
@@ -112,14 +113,18 @@ void RaidNaxxStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
         { NextAction("razuvious target", ACTION_RAID + 1) }
     ));
 
-    // four horsemen
-    triggers.push_back(new TriggerNode("four horsemen attractors",
-        { NextAction("four horsemen attract alternatively", ACTION_RAID + 1) }
-    ));
+    if (naxx40)
+        AddFourHorsemen40Triggers(triggers);
+    else
+    {
+        triggers.push_back(new TriggerNode("four horsemen attractors",
+            { NextAction("four horsemen attract alternatively", ACTION_RAID + 1) }
+        ));
 
-    triggers.push_back(new TriggerNode("four horsemen except attractors",
-        { NextAction("four horsemen attack in order", ACTION_RAID + 1) }
-    ));
+        triggers.push_back(new TriggerNode("four horsemen except attractors",
+            { NextAction("four horsemen attack in order", ACTION_RAID + 1) }
+        ));
+    }
 
     // Sapphiron
     if (naxx40)
@@ -185,7 +190,10 @@ void RaidNaxxStrategy::InitMultipliers(std::vector<Multiplier*>& multipliers)
     multipliers.push_back(new InstructorRazuviousGenericMultiplier(botAI));
     multipliers.push_back(new KelthuzadGenericMultiplier(botAI));
     multipliers.push_back(new AnubrekhanGenericMultiplier(botAI));
-    multipliers.push_back(new FourHorsemenGenericMultiplier(botAI));
+    if (naxx40)
+        AddFourHorsemen40Multipliers(botAI, multipliers);
+    else
+        multipliers.push_back(new FourHorsemenGenericMultiplier(botAI));
     // multipliers.push_back(new GothikGenericMultiplier(botAI));
     if (naxx40)
         AddGluth40Multipliers(botAI, multipliers);

@@ -11,6 +11,7 @@
 #include "BWLTriggerContext.h"
 #include "ChatTriggerContext.h"
 #include "EoETriggerContext.h"
+#include "FourHorsemen40.h"
 #include "Gluth40.h"
 #include "Grobbulus40.h"
 #include "GruulTriggerContext.h"
@@ -57,6 +58,7 @@ void AiObjectContext::BuildSharedTriggerContexts(
     triggerContexts.Add(new Naxx40SlimeTriggerContext());
     triggerContexts.Add(new Naxx40MilitaryTriggerContext());
     triggerContexts.Add(new Patchwerk40TriggerContext());
+    triggerContexts.Add(new FourHorsemen40TriggerContext());
     triggerContexts.Add(new Gluth40TriggerContext());
     triggerContexts.Add(new Grobbulus40TriggerContext());
     triggerContexts.Add(new Sapphiron40TriggerContext());
