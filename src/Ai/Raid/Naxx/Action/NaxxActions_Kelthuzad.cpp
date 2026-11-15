@@ -5,8 +5,13 @@
  */
 
 #include "NaxxActions.h"
+#include "Map.h"
+#include "MotionMaster.h"
+#include "Pet.h"
 #include "PlayerbotAIConfig.h"
 #include "Playerbots.h"
+
+#include <algorithm>
 
 bool KelthuzadChooseTargetAction::Execute(Event /*event*/)
 {
@@ -14,6 +19,40 @@ bool KelthuzadChooseTargetAction::Execute(Event /*event*/)
         return false;
 
     GuidVector attackers = context->GetValue<GuidVector>("attackers")->Get();
+    if (helper.IsNaxx40PhaseOne())
+    {
+        if (!helper.InNaxx40Camp() || PlayerbotAI::IsHeal(bot))
+            return false;
+
+        Unit* incoming = nullptr;
+        for (ObjectGuid const& guid : attackers)
+        {
+            Unit* candidate = botAI->GetUnit(guid);
+            if (!helper.IsNaxx40Incoming(candidate))
+                continue;
+
+            // Ranged players intercept Soldiers first. Fight from camp while the other adds come to us.
+            bool const soldier = helper.IsNaxx40Soldier(candidate);
+            bool const samePriority = soldier == helper.IsNaxx40Soldier(incoming);
+            if (!incoming || (soldier && !samePriority) ||
+                (samePriority && candidate->GetExactDist2d(helper.center.first, helper.center.second) <
+                                 incoming->GetExactDist2d(helper.center.first, helper.center.second)))
+                incoming = candidate;
+        }
+        if (!incoming || AI_VALUE(Unit*, "current target") == incoming)
+            return false;
+
+        if (helper.IsNaxx40Soldier(incoming) && bot->IsWithinMeleeRange(incoming))
+        {
+            // AttackAction would start a melee swing on a Soldier that has already reached us.
+            bot->AttackStop();
+            bot->SetSelection(incoming->GetGUID());
+            context->GetValue<Unit*>("current target")->Set(incoming);
+            return true;
+        }
+        return Attack(incoming, false);
+    }
+
     Unit* target = nullptr;
     Unit *target_soldier = nullptr, *target_weaver = nullptr, *target_abomination = nullptr, *target_kelthuzad = nullptr,
          *target_guardian = nullptr;
@@ -113,6 +152,49 @@ bool KelthuzadPositionAction::Execute(Event /*event*/)
 {
     if (!helper.UpdateBossAI())
         return false;
+
+    if (helper.IsNaxx40PhaseOne())
+    {
+        bool stopped = false;
+        Unit* current = AI_VALUE(Unit*, "current target");
+        if (!helper.InNaxx40Camp() || (current && !helper.IsNaxx40Incoming(current)) ||
+            (bot->GetVictim() && !helper.IsNaxx40Incoming(bot->GetVictim())))
+        {
+            stopped = bot->AttackStop() || current;
+            if (current)
+                context->GetValue<Unit*>("current target")->Set(nullptr);
+
+            for (CurrentSpellTypes slot : {CURRENT_GENERIC_SPELL, CURRENT_CHANNELED_SPELL, CURRENT_AUTOREPEAT_SPELL})
+            {
+                Spell* spell = bot->GetCurrentSpell(slot);
+                if (spell && !spell->GetSpellInfo()->IsPositive())
+                {
+                    bot->InterruptSpell(slot);
+                    stopped = true;
+                }
+            }
+        }
+        if (Pet* pet = bot->GetPet(); pet && pet->GetVictim() &&
+            (!helper.InNaxx40Camp(pet) || helper.IsNaxx40Soldier(pet->GetVictim()) ||
+             !helper.IsNaxx40Incoming(pet->GetVictim())))
+        {
+            pet->AttackStop();
+            pet->GetMotionMaster()->MoveFollow(bot, PET_FOLLOW_DIST, PET_FOLLOW_ANGLE);
+            stopped = true;
+        }
+
+        int const slot = std::max(0, botAI->GetGroupSlotIndex(bot));
+        float const angle = static_cast<float>(slot % 16) * static_cast<float>(M_PI) / 8.0f;
+        float const radius = PlayerbotAI::IsTank(bot) ? 3.0f :
+            (PlayerbotAI::IsRanged(bot) || PlayerbotAI::IsHeal(bot) ? 8.0f : 5.0f);
+        float const x = PlayerbotAI::IsMainTank(bot) ? helper.tank_pos.first : helper.center.first + cos(angle) * radius;
+        float const y = PlayerbotAI::IsMainTank(bot) ? helper.tank_pos.second : helper.center.second + sin(angle) * radius;
+        float const z = bot->GetMapHeight(x, y, bot->GetPositionZ() + 2.0f);
+        if (z <= INVALID_HEIGHT || bot->GetExactDist2d(x, y) <= 2.5f)
+            return stopped;
+
+        return MoveTo(NAXX_MAP_ID, x, y, z, false, false, false, false, MovementPriority::MOVEMENT_COMBAT) || stopped;
+    }
 
     if (helper.IsPhaseOne())
     {

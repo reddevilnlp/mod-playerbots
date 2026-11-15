@@ -9,6 +9,7 @@
 #include "DKActions.h"
 #include "DruidActions.h"
 #include "DruidBearActions.h"
+#include "EncounterHelpers.h"
 #include "FollowActions.h"
 #include "GenericSpellActions.h"
 #include "HunterActions.h"
@@ -24,9 +25,12 @@
 #include "ScriptedCreature.h"
 #include "ShamanActions.h"
 #include "Spell.h"
+#include "SpellMgr.h"
 #include "UseMeetingStoneAction.h"
 #include "WarriorActions.h"
 #include "WipeAction.h"
+
+#include <algorithm>
 
 float GrobbulusMultiplier::GetValue(Action* action)
 {
@@ -197,6 +201,42 @@ float KelthuzadGenericMultiplier::GetValue(Action* action)
 {
     if (!helper.UpdateBossAI())
         return 1.0f;
+
+    if (helper.IsNaxx40PhaseOne())
+    {
+        if (dynamic_cast<KelthuzadPositionAction*>(action) || dynamic_cast<KelthuzadChooseTargetAction*>(action) ||
+            dynamic_cast<CastHealingSpellAction*>(action) || dynamic_cast<WipeAction*>(action))
+            return 1.0f;
+
+        if (dynamic_cast<ReachPartyMemberToHealAction*>(action) || dynamic_cast<ReachPartyMemberToResurrectAction*>(action))
+        {
+            Unit const* target = action->GetTarget();
+            return target && helper.InNaxx40Camp(target) ? 1.0f : 0.0f;
+        }
+
+        bool const melee = dynamic_cast<MeleeAction*>(action) || dynamic_cast<CastMeleeSpellAction*>(action);
+        if ((dynamic_cast<MovementAction*>(action) && !dynamic_cast<MeleeAction*>(action)) ||
+            dynamic_cast<CastReachTargetSpellAction*>(action) || dynamic_cast<PetAttackAction*>(action) ||
+            action->getName() == "dungeon clear assist camp combat" || EncounterHelpers::IsAoeThreatAction(bot, action))
+            return 0.0f;
+
+        auto* cast = dynamic_cast<CastSpellAction*>(action);
+        SpellInfo const* spell = cast ? sSpellMgr->GetSpellInfo(AI_VALUE2(uint32, "spell id", cast->getSpell())) : nullptr;
+        Unit* target = melee || cast ? action->GetTarget() : nullptr;
+        bool const hostileTarget = target && bot->IsValidAttackTarget(target);
+        if (melee || hostileTarget || (spell && !spell->IsPositive()))
+        {
+            if (spell && !spell->IsPositive() && (spell->IsAffectingArea() || spell->IsTargetingArea() ||
+                std::ranges::any_of(spell->Effects, [](SpellEffectInfo const& effect) { return effect.ChainTarget > 1; })))
+                return 0.0f;
+
+            if (!hostileTarget)
+                target = AI_VALUE(Unit*, "current target");
+            if (!helper.InNaxx40Camp() || !helper.IsNaxx40Incoming(target) ||
+                (melee && helper.IsNaxx40Soldier(target)))
+                return 0.0f;
+        }
+    }
 
     if ((dynamic_cast<DpsAssistAction*>(action) || dynamic_cast<TankAssistAction*>(action) ||
          dynamic_cast<CastDebuffSpellOnAttackerAction*>(action) || dynamic_cast<FleeAction*>(action)))

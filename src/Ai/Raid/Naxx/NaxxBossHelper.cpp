@@ -5,6 +5,9 @@
  */
 
 #include "NaxxBossHelper.h"
+#include "Ai/Raid/Naxx40/Naxx40Encounter.h"
+#include "Creature.h"
+#include "InstanceScript.h"
 #include "Playerbots.h"
 #include "SpellAuras.h"
 #include "Timer.h"
@@ -13,6 +16,15 @@
 
 namespace
 {
+    // Individual Progression's data slot and 40-player encounter entries.
+    constexpr uint32 DataKelthuzadBoss = 111;
+    constexpr uint32 Kelthuzad40Entry = 351019;
+    constexpr uint32 Soldier40Entry = 351073;
+    constexpr uint32 Abomination40Entry = 351074;
+    constexpr uint32 Weaver40Entry = 351075;
+    constexpr float KelthuzadCampRadius = 13.0f;
+    constexpr float KelthuzadIncomingRadius = 34.0f;
+
     // A fight not observed for this long is over (wipe / evade); the next pull starts from scratch.
     constexpr uint32 HeiganStateStaleMs = 30000;
 
@@ -28,6 +40,58 @@ namespace
         static HeiganFightRegistry registry;
         return registry;
     }
+}
+
+bool KelthuzadBossHelper::UpdateBossAI()
+{
+    if (IsNaxx40Map(bot->FindMap()))
+    {
+        InstanceScript* instance = bot->GetInstanceScript();
+        Creature* boss = instance ? instance->GetCreature(DataKelthuzadBoss) : nullptr;
+        _unit = bot->IsInCombat() && boss && boss->GetEntry() == Kelthuzad40Entry && boss->IsAlive() &&
+                boss->IsInCombat() && bot->GetExactDist2d(center.first, center.second) <= 110.0f ? boss : nullptr;
+        return _unit != nullptr;
+    }
+
+    if (!bot->IsInCombat() || (_unit && (!_unit->IsInWorld() || !_unit->IsAlive())))
+        Reset();
+    if (!_unit)
+        _unit = AI_VALUE2(Unit*, "find target", "kel'thuzad");
+    return _unit != nullptr;
+}
+
+bool KelthuzadBossHelper::IsNaxx40PhaseOne()
+{
+    return IsPhaseOne() && _unit->GetEntry() == Kelthuzad40Entry;
+}
+
+bool KelthuzadBossHelper::InNaxx40Camp(Unit const* member) const
+{
+    return (member ? member : bot)->GetExactDist2d(center.first, center.second) <= KelthuzadCampRadius;
+}
+
+bool KelthuzadBossHelper::IsNaxx40Soldier(Unit const* target)
+{
+    return target && target->GetEntry() == Soldier40Entry;
+}
+
+bool KelthuzadBossHelper::IsNaxx40Incoming(Unit* target) const
+{
+    Creature* add = target ? target->ToCreature() : nullptr;
+    if (!add || (add->GetEntry() != Soldier40Entry && add->GetEntry() != Abomination40Entry &&
+                 add->GetEntry() != Weaver40Entry))
+        return false;
+
+    if (!_unit || add->GetSummonerGUID() != _unit->GetGUID() || !add->IsInCombat() ||
+        !add->GetVictim() || !add->IsAlive() ||
+        add->GetExactDist2d(center.first, center.second) > KelthuzadIncomingRadius ||
+        !bot->IsValidAttackTarget(add) || !bot->IsWithinLOSInMap(add))
+        return false;
+
+    if (PlayerbotAI::IsRanged(bot) && !PlayerbotAI::IsTank(bot))
+        return bot->IsWithinDistInMap(add, sPlayerbotAIConfig.SpellDistance);
+
+    return !IsNaxx40Soldier(add) && bot->IsWithinMeleeRange(add);
 }
 
 bool HeiganBossHelper::UpdateBossAI()

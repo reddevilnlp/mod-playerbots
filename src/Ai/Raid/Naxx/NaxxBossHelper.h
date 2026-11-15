@@ -178,21 +178,13 @@ public:
     const std::pair<float, float> center = {3716.19f, -5106.58f};
     const std::pair<float, float> tank_pos = {3709.19f, -5104.86f};
     const std::pair<float, float> assist_tank_pos = {3746.05f, -5112.74f};
-    bool UpdateBossAI()
-    {
-        if (!bot->IsInCombat())
-            Reset();
-
-        if (_unit && (!_unit->IsInWorld() || !_unit->IsAlive()))
-            Reset();
-
-        if (!_unit)
-            _unit = AI_VALUE2(Unit*, "find target", "kel'thuzad");
-
-        return _unit != nullptr;
-    }
+    bool UpdateBossAI();
     bool IsPhaseOne() { return _unit && _unit->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE); }
     bool IsPhaseTwo() { return _unit && !_unit->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE); }
+    bool IsNaxx40PhaseOne();
+    bool InNaxx40Camp(Unit const* member = nullptr) const;
+    bool IsNaxx40Incoming(Unit* target) const;
+    static bool IsNaxx40Soldier(Unit const* target);
     Unit* GetAnyShadowFissure()
     {
         Unit* shadow_fissure = nullptr;
