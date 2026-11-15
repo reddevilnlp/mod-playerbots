@@ -80,6 +80,7 @@ constexpr float RearCornerRange = 14.0f;
 constexpr float RearSupportLocalRange = 28.0f;
 constexpr float HealerCoverageRange = 35.0f;
 constexpr float HealerCoverageMana = 10.0f;
+constexpr float RearTankUrgentHealth = 75.0f;
 constexpr float SupportTransferRange = 40.0f;
 constexpr float MeteorSoakRange = 8.0f;
 constexpr uint8 MinimumMeteorSoak = 5;
@@ -92,6 +93,7 @@ constexpr float RearMarkClearance = 48.0f;
 constexpr float FrontMarkClearance = 58.0f;
 constexpr float FrontRotationBossRange = 15.0f;
 constexpr uint32 TauntSpell = 355;
+constexpr uint32 MockingBlow = 694;
 constexpr uint32 ShootRangedWeapon = 3018;
 constexpr uint32 Bloodrage = 2687;
 constexpr uint32 DefensiveStance = 71;
@@ -270,6 +272,7 @@ struct Assignment
     bool stagedTank = false;
     bool openingThreat = false;
     bool rearSideHealer = false;
+    ObjectGuid rearSwapPartner;
     uint32 frontOpeningAt = 0;
     bool frontHandoffThreat = false;
 };
@@ -1149,7 +1152,9 @@ void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
     };
 
     bool const rearOnly = plan.individualArmed && !bosses[0] && !bosses[1];
-    if (rearOnly)
+    bool const rearHealersCanAnchor = rearOnly ||
+        (plan.rearReleased && plan.reached[2] && plan.reached[3] && plan.rotations[1].changedAt);
+    if (rearHealersCanAnchor)
         for (uint8 corner : {uint8(2), uint8(3)})
         {
             ObjectGuid& fixed = plan.rearSideHealers[corner - 2];
@@ -1161,6 +1166,7 @@ void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
                 {
                     if (!candidate.healer || candidate.corner != NoCorner || candidate.member.clearingMarks ||
                         candidate.member.guid == plan.rearSideHealers[(corner - 2) ^ 1] ||
+                        (!rearOnly && (candidate.member.home < 2 || candidate.member.supportSlot >= 2)) ||
                         candidate.player->GetPowerPct(POWER_MANA) < HealerCoverageMana ||
                         candidate.player->HasUnitFlag(UNIT_FLAG_SILENCED))
                         continue;
@@ -1175,10 +1181,12 @@ void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
                         break;
                     }
                     float const distance = candidate.player->GetExactDist(pads[nearSlot]);
+                    uint8 doubled = 0;
                     if (distance >= closest || candidate.player->isMoving() ||
                         std::any_of(Horsemen.begin(), Horsemen.end(), [&](Horseman const& rider)
                         {
-                            return candidate.player->GetAuraCount(rider.mark) >= RotationStacks;
+                            uint32 const stacks = candidate.player->GetAuraCount(rider.mark);
+                            return stacks > RotationStacks || (stacks == RotationStacks && ++doubled >= 2);
                         }))
                         continue;
                     choice = &candidate;
@@ -1410,7 +1418,7 @@ void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
         {
             return &witness != &leaving && witness.healer && witness.corner == corner &&
                 !witness.authorizedToLeave && !witness.member.clearingMarks &&
-                (!rearOnly || !witness.player->isMoving()) &&
+                (corner < 2 || !rearHealersCanAnchor || !witness.player->isMoving()) &&
                 (!leaving.earlyRearHealer || !witness.marks) &&
                 (witness.member.coveringTank.IsEmpty() || witness.member.coveringTank == tanks[corner]->GetGUID()) &&
                 witness.player->GetPowerPct(POWER_MANA) >= HealerCoverageMana &&
@@ -1498,7 +1506,7 @@ void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
                 if (spare)
                 {
                     occupy(*spare, from, slot);
-                    if (candidate.earlyRearHealer || candidate.earlyFrontSupport || (rearOnly && from >= 2))
+                    if (candidate.earlyRearHealer || candidate.earlyFrontSupport || (rearHealersCanAnchor && from >= 2))
                     {
                         // Keep the incoming healer with this tank while they get into casting range.
                         spare->member.coveringTank = tanks[from]->GetGUID();
@@ -1916,10 +1924,12 @@ Assignment AssignmentFor(Player& bot, Bosses const& bosses)
         now - rotation.securedAt < FrontHandoffThreatWindow;
     bool const rearSideHealer = !holder && !standby && corner >= 2 &&
         plan.rearSideHealers[corner - 2] == member->guid;
+    ObjectGuid const rearSwapPartner = rearSideHealer ?
+        plan.holders[AssignedCorner(corner ^ 1, rotation)] : ObjectGuid{};
     return {corner, member->assignedSlot, holder, rotation.handoff, corner >= 2 && !plan.rearReleased,
             plan.holders[AssignedCorner(corner, rotation)], standby, followsReceiving || corner != homeCorner,
             member->clearingMarks, plan.individualArmed, followsAssigned, stagedHealer, stagedTank, openingThreat,
-            rearSideHealer, frontOpeningAt, frontHandoffThreat};
+            rearSideHealer, rearSwapPartner, frontOpeningAt, frontHandoffThreat};
 }
 
 class FourHorsemen40Action final : public AttackAction
@@ -2051,14 +2061,17 @@ public:
         {
             DropAttack();
             fighting = false;
-            Player const* const tank = PlayerInRaid(*bot, assignment.targetHolder);
-            bool const coversSide = tank && bot->GetExactDist(position) <= RearSupportLocalRange &&
-                bot->IsWithinDistInMap(tank, HealerCoverageRange) && bot->IsWithinLOSInMap(tank);
+            Player* tank = PlayerInRaid(*bot, assignment.targetHolder);
+            Unit const* const victim = bosses[corner] ? bosses[corner]->GetVictim() : nullptr;
+            if (victim && victim->GetGUID() == assignment.rearSwapPartner)
+                if (Player* const outgoing = PlayerInRaid(*bot, assignment.rearSwapPartner); CanReachRearTank(outgoing))
+                    tank = outgoing;
+            bool const coversSide = bot->GetExactDist(position) <= RearSupportLocalRange && CanReachRearTank(tank);
             if (coversSide || bot->GetExactDist(position) <= CornerArrival)
             {
                 if (bot->isMoving())
                     bot->StopMoving();
-                return false;
+                return coversSide && HealRearTank(*tank);
             }
             return WalkTo(position, true);
         }
@@ -2071,9 +2084,22 @@ public:
             return true;
         }
 
-        bool const needsTaunt = holder && target && target->GetVictim() != bot;
+        Unit const* const actualVictim = target ? target->GetVictim() : nullptr;
+        bool const needsTaunt = holder && target && actualVictim != bot;
         if (needsTaunt && RaidClear::Tanks::Taunt(botAI, target))
             return true;
+        if (needsTaunt && actualVictim && corner < 2 && bot->getClass() == CLASS_WARRIOR &&
+            bot->IsWithinMeleeRange(target) && bot->IsWithinLOSInMap(target))
+        {
+            ShapeshiftForm const form = bot->GetShapeshiftForm();
+            if ((form == FORM_BATTLESTANCE || form == FORM_DEFENSIVESTANCE) &&
+                botAI->CanCastSpell(MockingBlow, target) && botAI->CastSpell(MockingBlow, target))
+            {
+                LOG_INFO("playerbots", "[Naxx40] Horsemen front instance={} {} uses Mocking Blow on {} (victim {})",
+                    bot->GetInstanceId(), bot->GetName(), target->GetName(), actualVictim->GetName());
+                return true;
+            }
+        }
         if (assignment.openingThreat && target && BuildFeralOpeningThreat(*botAI, *target))
             return true;
         if (target && (assignment.frontOpeningAt || assignment.frontHandoffThreat) &&
@@ -2144,6 +2170,30 @@ public:
     bool HoldingRearCorner() const { return holder && corner >= 2 && corner < CornerCount; }
 
 private:
+    bool CanReachRearTank(Player const* tank) const
+    {
+        return tank && bot->IsWithinDistInMap(tank, HealerCoverageRange) && bot->IsWithinLOSInMap(tank);
+    }
+
+    bool HealRearTank(Player& tank)
+    {
+        if (tank.GetHealthPct() >= RearTankUrgentHealth || bot->IsNonMeleeSpellCast(true))
+            return false;
+        std::array<char const*, 2> spells;
+        switch (bot->getClass())
+        {
+            case CLASS_DRUID:   spells = {"swiftmend", "regrowth"}; break;
+            case CLASS_PALADIN: spells = {"holy shock", "flash of light"}; break;
+            case CLASS_PRIEST:  spells = {"penance", "flash heal"}; break;
+            case CLASS_SHAMAN:  spells = {"riptide", "lesser healing wave"}; break;
+            default: return false;
+        }
+        for (char const* spell : spells)
+            if (botAI->CanCastSpell(spell, &tank) && botAI->CastSpell(spell, &tank))
+                return true;
+        return false;
+    }
+
     MeteorResponse RespondToMeteor(Assignment const& assignment, Bosses const& bosses)
     {
         Creature const* korth = bosses[0];
