@@ -14,10 +14,13 @@
 #include <cmath>
 #include <optional>
 
+#include "CellImpl.h"
 #include "Creature.h"
 #include "DKActions.h"
 #include "DynamicObject.h"
 #include "GameObject.h"
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
 #include "InstanceScript.h"
 #include "Map.h"
 #include "MotionMaster.h"
@@ -43,12 +46,17 @@ constexpr uint32 IceBlockEntry = 181247;
 constexpr uint32 IceboltAura = 28522;
 constexpr uint32 ChillAura = 28547;
 constexpr uint32 SnapshotIntervalMs = 200;
+constexpr uint32 OpeningHoldMs = 6500;
 constexpr uint32 IncompleteVolleyMs = 12000;
 constexpr uint32 IceboltTravelMarginMs = 1100;
 constexpr size_t IceboltCount = 3;
 constexpr float ArenaSearchRadius = 75.0f;
-constexpr float BlizzardRadius = 12.0f;
+constexpr float BlizzardApproachRadius = 5.5f;
+// Area checks include the target's combat reach, which is usually 1.5 yards.
+constexpr float BlizzardEdgeMargin = 2.5f;
 constexpr float GroundDangerRadius = 35.0f;
+constexpr float OpeningAdvanceRadius = 38.0f;
+constexpr float OpeningLateralClearance = 14.0f;
 constexpr float GroundFlankStart = 94.0f;
 constexpr float GroundFlankEnd = 116.0f;
 constexpr float CoverWidth = 2.0f;
@@ -57,18 +65,26 @@ constexpr float Pi = 3.14159265f;
 
 constexpr char GroundTrigger[] = "sapphiron 40 ground phase";
 constexpr char FlightTrigger[] = "sapphiron 40 flight phase";
+constexpr char BlizzardTrigger[] = "sapphiron 40 blizzard nearby";
 constexpr char PositionAction[] = "sapphiron 40 position";
+
+struct BlizzardZone
+{
+    Position center;
+    float radius;
+};
 
 struct Observation
 {
     uint32 instanceId = 0;
     ObjectGuid bossGuid;
     uint32 sampledAt = 0;
+    uint32 engagedAt = 0;
     uint32 liftedAt = 0;
     uint32 finalBlockAt = 0;
     bool sheltering = false;
     std::vector<ObjectGuid> blocks;
-    std::vector<Position> blizzards;
+    std::vector<BlizzardZone> blizzards;
 };
 
 Creature* FindSapphiron(Player* bot)
@@ -95,6 +111,7 @@ Observation const& Observe(Creature& boss)
         state = Observation{};
         state.instanceId = boss.GetInstanceId();
         state.bossGuid = boss.GetGUID();
+        state.engagedAt = now;
     }
 
     if (state.sampledAt && now - state.sampledAt < SnapshotIntervalMs)
@@ -106,7 +123,22 @@ Observation const& Observe(Creature& boss)
     boss.GetCreatureListWithEntryInGrid(blizzards, BlizzardEntry, ArenaSearchRadius);
     for (Creature const* blizzard : blizzards)
         if (blizzard->IsAlive() && blizzard->GetSummonerGUID() == boss.GetGUID())
-            state.blizzards.push_back(blizzard->GetPosition());
+            state.blizzards.push_back({blizzard->GetPosition(), BlizzardApproachRadius});
+
+    // Each pulse leaves a patch at its cast position while the Blizzard creature keeps moving.
+    std::list<WorldObject*> objects;
+    Acore::AllWorldObjectsInRange check(&boss, ArenaSearchRadius);
+    Acore::WorldObjectListSearcher<Acore::AllWorldObjectsInRange> searcher(
+        &boss, objects, check, GRID_MAP_TYPE_MASK_DYNAMICOBJECT);
+    Cell::VisitObjects(&boss, searcher, ArenaSearchRadius);
+    for (WorldObject const* object : objects)
+        if (DynamicObject const* patch = object->ToDynObject();
+            patch && patch->GetSpellId() == ChillAura && patch->GetDuration() > 0 &&
+            std::any_of(blizzards.begin(), blizzards.end(), [&boss, patch](Creature const* blizzard)
+            {
+                return blizzard->GetGUID() == patch->GetCasterGUID() && blizzard->GetSummonerGUID() == boss.GetGUID();
+            }))
+            state.blizzards.push_back({patch->GetPosition(), patch->GetRadius() + BlizzardEdgeMargin});
 
     state.blocks.clear();
     if (!boss.IsFlying())
@@ -165,40 +197,51 @@ Position SpreadPosition(Creature const& boss, uint32 slot)
 
 bool NearBlizzard(Position const& position, Observation const& state)
 {
-    return std::any_of(state.blizzards.begin(), state.blizzards.end(), [&position](Position const& blizzard)
-                       { return position.GetExactDist2dSq(blizzard) < BlizzardRadius * BlizzardRadius; });
+    return std::any_of(state.blizzards.begin(), state.blizzards.end(), [&position](BlizzardZone const& blizzard)
+                       { return position.GetExactDist2dSq(blizzard.center) < blizzard.radius * blizzard.radius; });
 }
 
-std::optional<Position> EscapeBlizzard(Player const& bot, Creature const& boss, Observation const& state)
+bool CanReachDry(PlayerbotAI* ai, Player& bot, Position const& destination);
+
+std::optional<Position> EscapeBlizzard(PlayerbotAI* ai, Player& bot, Creature const& boss, Observation const& state)
 {
     Position const* danger = nullptr;
-    float minDistanceSq = BlizzardRadius * BlizzardRadius;
-    for (Position const& blizzard : state.blizzards)
+    float minDistanceSq = 0.0f;
+    for (BlizzardZone const& blizzard : state.blizzards)
     {
-        float const distanceSq = bot.GetExactDist2dSq(blizzard);
-        if (distanceSq < minDistanceSq)
+        float const distanceSq = bot.GetExactDist2dSq(blizzard.center);
+        if (distanceSq < blizzard.radius * blizzard.radius && (!danger || distanceSq < minDistanceSq))
         {
-            danger = &blizzard;
+            danger = &blizzard.center;
             minDistanceSq = distanceSq;
         }
     }
 
     Aura const* chill = bot.GetAura(ChillAura);
     if (!danger && chill && chill->GetType() == DYNOBJ_AURA_TYPE)
-        danger = chill->GetDynobjOwner();
+        if (DynamicObject const* patch = chill->GetDynobjOwner();
+            bot.GetExactDist2d(patch) < patch->GetRadius() + BlizzardEdgeMargin)
+            danger = patch;
     if (!danger)
         return std::nullopt;
 
     float const away = danger->GetAngle(&bot);
-    for (float angleOffset : {0.0f, Pi / 5.0f, -Pi / 5.0f, 2.0f * Pi / 5.0f, -2.0f * Pi / 5.0f})
-    {
-        Position const destination = Offset(bot, away + angleOffset, 14.0f);
-        if (destination.GetExactDist2dSq(boss.GetHomePosition()) < 38.0f * 38.0f &&
-            destination.GetExactDist2dSq(danger) >= BlizzardRadius * BlizzardRadius &&
-            !NearBlizzard(destination, state) &&
-            bot.IsWithinLOS(destination.GetPositionX(), destination.GetPositionY(), destination.GetPositionZ()))
-            return destination;
-    }
+    for (float distance : {6.0f, 9.0f, 12.0f})
+        for (float angleOffset : {0.0f, Pi / 4.0f, -Pi / 4.0f, Pi / 2.0f, -Pi / 2.0f, Pi})
+        {
+            Position destination = Offset(bot, away + angleOffset, distance);
+            if (destination.GetExactDist2dSq(boss.GetHomePosition()) >= 42.0f * 42.0f ||
+                destination.GetExactDist2dSq(danger) < BlizzardEdgeMargin * BlizzardEdgeMargin ||
+                NearBlizzard(destination, state))
+                continue;
+            float const ground = bot.GetMapHeight(destination.GetPositionX(), destination.GetPositionY(),
+                                                   destination.GetPositionZ() + 2.0f);
+            if (ground <= INVALID_HEIGHT || std::abs(ground - destination.GetPositionZ()) > 3.0f)
+                continue;
+            destination.Relocate(destination.GetPositionX(), destination.GetPositionY(), ground);
+            if (CanReachDry(ai, bot, destination))
+                return destination;
+        }
     return std::nullopt;
 }
 
@@ -247,6 +290,53 @@ bool CanReachDry(PlayerbotAI* ai, Player& bot, Position const& destination)
     return points.size() >= 2;
 }
 
+Player* GroundTank(Creature const& boss)
+{
+    Unit* victim = boss.GetVictim();
+    Player* tank = victim ? victim->ToPlayer() : nullptr;
+    return tank && tank->IsAlive() && (PlayerbotAI::IsTank(tank) || PlayerbotAI::IsExplicitMainTank(tank)) ? tank : nullptr;
+}
+
+bool HoldingOpening(Creature const& boss, Player const& bot, Observation const& state)
+{
+    Player const* tank = GroundTank(boss);
+    return tank && tank != &bot && getMSTime() - state.engagedAt < OpeningHoldMs;
+}
+
+std::optional<Position> OpeningFlank(PlayerbotAI* ai, Player& bot, Creature const& boss, Observation const& state,
+                                     uint32 slot)
+{
+    // The ranged pull starts Cleave's timer while the boss is still running at the tank.
+    // Stay back or take a short step sideways, away from the tank's chain-Cleave targets.
+    if (bot.GetExactDist2d(&boss) > OpeningAdvanceRadius)
+        return std::nullopt;
+
+    Player const* tank = GroundTank(boss);
+    if (!tank)
+        return std::nullopt;
+    float const axis = boss.GetAngle(tank) + Pi / 2.0f;
+    float const lateral = (bot.GetPositionX() - tank->GetPositionX()) * std::cos(axis) +
+                          (bot.GetPositionY() - tank->GetPositionY()) * std::sin(axis);
+    if (std::abs(lateral) >= OpeningLateralClearance)
+        return std::nullopt;
+    float const preferred = std::abs(lateral) < 1.0f ? (slot % 2 ? 1.0f : -1.0f) : (lateral < 0.0f ? -1.0f : 1.0f);
+    for (float side : {preferred, -preferred})
+    {
+        float const distance = OpeningLateralClearance - lateral * side;
+        if (distance > 18.0f)
+            continue;
+        Position destination = Offset(bot, axis + (side < 0.0f ? Pi : 0.0f), distance);
+        float const ground = bot.GetMapHeight(destination.GetPositionX(), destination.GetPositionY(),
+                                               destination.GetPositionZ() + 2.0f);
+        if (ground <= INVALID_HEIGHT || std::abs(ground - destination.GetPositionZ()) > 3.0f)
+            continue;
+        destination.Relocate(destination.GetPositionX(), destination.GetPositionY(), ground);
+        if (!NearBlizzard(destination, state) && CanReachDry(ai, bot, destination))
+            return destination;
+    }
+    return std::nullopt;
+}
+
 bool HasCover(Player const& bot, Creature const& boss, Observation const& state)
 {
     for (ObjectGuid const& guid : state.blocks)
@@ -256,10 +346,12 @@ bool HasCover(Player const& bot, Creature const& boss, Observation const& state)
     return false;
 }
 
-std::optional<Position> FindShelter(Player const& bot, Creature const& boss, Observation const& state, uint32 slot)
+std::optional<Position> FindShelter(PlayerbotAI* ai, Player& bot, Creature const& boss, Observation const& state,
+                                    uint32 slot)
 {
     std::optional<Position> best;
     float bestCost = 0.0f;
+    bool bestInBlizzard = true;
     uint32 const count = static_cast<uint32>(state.blocks.size());
     uint32 const seat = slot / count;
     float const depth = 3.0f + 1.1f * (seat % 5);
@@ -278,14 +370,15 @@ std::optional<Position> FindShelter(Player const& bot, Creature const& boss, Obs
             continue;
         destination.Relocate(destination.GetPositionX(), destination.GetPositionY(), ground);
 
-        // Prefer nearby cover so bots can reach it during the breath cast. Bias adjacent raid slots
-        // toward different blocks when distances are close, and avoid a blizzard when another block is near.
-        float const cost = bot.GetExactDist2d(destination) + (i == slot % count ? 0.0f : 4.0f) +
-                           (NearBlizzard(destination, state) ? 8.0f : 0.0f);
-        if (!best || cost < bestCost)
+        // Prefer safe cover even if it uses another block. Slots spread when distances are close.
+        bool const inBlizzard = NearBlizzard(destination, state);
+        float const cost = bot.GetExactDist2d(destination) + (i == slot % count ? 0.0f : 4.0f);
+        if ((!best || (bestInBlizzard && !inBlizzard) || (bestInBlizzard == inBlizzard && cost < bestCost)) &&
+            CanReachDry(ai, bot, destination))
         {
             best = destination;
             bestCost = cost;
+            bestInBlizzard = inBlizzard;
         }
     }
     return best;
@@ -312,42 +405,50 @@ public:
         uint32 const slot = static_cast<uint32>(std::clamp(botAI->GetGroupSlotIndex(bot), 0, 39));
         if (boss->IsFlying())
         {
-            if (state.sheltering)
+            if (state.sheltering && !state.blocks.empty())
             {
-                if (state.blocks.empty())
-                    return false;
+                bool const covered = HasCover(*bot, *boss, state);
+                if (covered && !NearBlizzard(*bot, state))
+                    return StopCurrentMove();
 
-                if (HasCover(*bot, *boss, state))
-                {
-                    if (!bot->isMoving())
-                        return false;
-
-                    bot->GetMotionMaster()->Clear();
-                    bot->StopMoving();
-                    AI_VALUE(LastMovement&, "last movement").clear();
+                auto const destination = FindShelter(botAI, *bot, *boss, state, slot);
+                if (destination && !NearBlizzard(*destination, state) &&
+                    Move(*destination, MovementPriority::MOVEMENT_FORCED))
                     return true;
-                }
-
-                if (auto const destination = FindShelter(*bot, *boss, state, slot))
+                // One pulse is survivable; don't walk into the open during Breath to avoid it.
+                if (covered)
+                    return StopCurrentMove();
+                if (destination)
                     return Move(*destination, MovementPriority::MOVEMENT_FORCED);
-                return false;
             }
 
-            if (auto const escape = EscapeBlizzard(*bot, *boss, state))
-                return Move(*escape, MovementPriority::MOVEMENT_COMBAT);
+            if (auto const escape = EscapeBlizzard(botAI, *bot, *boss, state))
+                return Move(*escape, MovementPriority::MOVEMENT_FORCED);
 
             Position const destination = SpreadPosition(*boss, slot);
             return bot->GetExactDist2dSq(destination) > 4.0f && !NearBlizzard(destination, state) &&
                    Move(destination, MovementPriority::MOVEMENT_COMBAT);
         }
 
-        if (auto const escape = EscapeBlizzard(*bot, *boss, state))
-            return Move(*escape, MovementPriority::MOVEMENT_COMBAT);
+        if (auto const escape = EscapeBlizzard(botAI, *bot, *boss, state))
+            return Move(*escape, MovementPriority::MOVEMENT_FORCED);
 
-        Unit* victim = boss->GetVictim();
-        Player* tank = victim ? victim->ToPlayer() : nullptr;
-        if (!tank || tank == bot || !tank->IsAlive() ||
-            !(PlayerbotAI::IsTank(tank) || PlayerbotAI::IsExplicitMainTank(tank)) ||
+        if (HoldingOpening(*boss, *bot, state))
+        {
+            auto const destination = OpeningFlank(botAI, *bot, *boss, state, slot);
+            if (!destination)
+                return StopCurrentMove();
+            if (bot->isMoving() && !bot->movespline->Finalized())
+            {
+                G3D::Vector3 const end = bot->movespline->FinalDestination();
+                if (destination->GetExactDistSq(end.x, end.y, end.z) <= 4.0f)
+                    return true;
+            }
+            return Move(*destination, MovementPriority::MOVEMENT_COMBAT);
+        }
+
+        Player* tank = GroundTank(*boss);
+        if (!tank || tank == bot ||
             !boss->IsWithinMeleeRange(tank, 2.0f) || bot->GetExactDist2d(boss) > GroundDangerRadius ||
             InGroundFlank(*boss, *bot))
             return false;
@@ -386,6 +487,17 @@ public:
     }
 
 private:
+    bool StopCurrentMove()
+    {
+        if (!bot->isMoving())
+            return false;
+
+        bot->GetMotionMaster()->Clear();
+        bot->StopMoving();
+        AI_VALUE(LastMovement&, "last movement").clear();
+        return true;
+    }
+
     bool Move(Position const& destination, MovementPriority priority)
     {
         return MoveTo(bot->GetMapId(), destination.GetPositionX(), destination.GetPositionY(),
@@ -408,6 +520,18 @@ private:
     bool flight;
 };
 
+class SapphironBlizzardTrigger final : public Trigger
+{
+public:
+    explicit SapphironBlizzardTrigger(PlayerbotAI* ai) : Trigger(ai, BlizzardTrigger) {}
+
+    bool IsActive() override
+    {
+        Creature* boss = FindSapphiron(bot);
+        return boss && !bot->HasAura(IceboltAura, boss->GetGUID()) && NearBlizzard(*bot, Observe(*boss));
+    }
+};
+
 class SapphironPositionMultiplier final : public Multiplier
 {
 public:
@@ -415,12 +539,12 @@ public:
 
     float GetValue(Action* action) override
     {
-        Creature const* boss = FindSapphiron(bot);
+        Creature* boss = FindSapphiron(bot);
         if (!boss || dynamic_cast<SapphironPositionAction*>(action))
             return 1.0f;
 
         if (dynamic_cast<CombatFormationMoveAction*>(action) || dynamic_cast<CastDeathGripAction*>(action) ||
-            (boss->IsFlying() && dynamic_cast<MovementAction*>(action)))
+            (dynamic_cast<MovementAction*>(action) && (boss->IsFlying() || HoldingOpening(*boss, *bot, Observe(*boss)))))
             return 0.0f;
 
         return 1.0f;
@@ -437,12 +561,14 @@ Sapphiron40TriggerContext::Sapphiron40TriggerContext()
 {
     creators[GroundTrigger] = [](PlayerbotAI* ai) { return new SapphironPhaseTrigger(ai, GroundTrigger, false); };
     creators[FlightTrigger] = [](PlayerbotAI* ai) { return new SapphironPhaseTrigger(ai, FlightTrigger, true); };
+    creators[BlizzardTrigger] = [](PlayerbotAI* ai) { return new SapphironBlizzardTrigger(ai); };
 }
 
 void AddSapphiron40Triggers(std::vector<TriggerNode*>& triggers)
 {
     triggers.push_back(new TriggerNode(GroundTrigger, {NextAction(PositionAction, ACTION_RAID + 2)}));
     triggers.push_back(new TriggerNode(FlightTrigger, {NextAction(PositionAction, ACTION_EMERGENCY + 1)}));
+    triggers.push_back(new TriggerNode(BlizzardTrigger, {NextAction(PositionAction, ACTION_EMERGENCY + 2)}));
 }
 
 void AddSapphiron40Multipliers(PlayerbotAI* botAI, std::vector<Multiplier*>& multipliers)
