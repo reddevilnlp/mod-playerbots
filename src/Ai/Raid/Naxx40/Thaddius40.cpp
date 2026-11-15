@@ -22,6 +22,7 @@
 #include "Pet.h"
 #include "Player.h"
 #include "Playerbots.h"
+#include "RogueActions.h"
 #include "Spell.h"
 #include "SpellMgr.h"
 #include "Strategy.h"
@@ -574,6 +575,10 @@ public:
 
         if (CanAttack(fight.boss))
         {
+            // Killing Spree teleports behind Thaddius, bypassing the assigned charge lane.
+            if (dynamic_cast<CastKillingSpreeAction*>(action))
+                return 0.0f;
+
             int8 const polarity = Polarity(bot);
             bool const traveling = polarity && !AtChargePosition(*bot, ChargePosition(bot, polarity > 0 ? 1 : 0));
             return traveling && (melee || dynamic_cast<CastSpellAction*>(action)) ? 0.0f : 1.0f;
