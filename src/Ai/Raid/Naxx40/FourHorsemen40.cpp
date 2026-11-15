@@ -51,6 +51,7 @@ constexpr float TauntRange = 29.0f;
 constexpr float PlatformExitZ = 243.5f;
 constexpr float VoidEscapeCornerRadius = 6.0f;
 constexpr float RearCornerRange = 14.0f;
+constexpr float RearSupportLocalRange = 28.0f;
 // The two rear marks have a 45-yard radius. Leave room for combat reach.
 constexpr float RearMarkClearance = 48.0f;
 constexpr uint32 TauntSpell = 355;
@@ -677,14 +678,22 @@ public:
             return false;
 
         bool const reinforcing = assignment.redirected && !PlayerbotAI::IsHeal(bot);
-        bool const marksNeedRest = reinforcing &&
-            bot->GetAuraCount(Horsemen[corner].mark) > RotationStacks;
+        uint32 const targetMark = Horsemen[corner].mark;
+        bool const rearSupport = reinforcing && corner >= 2;
+        bool const tooManyMarks = reinforcing && bot->GetAuraCount(targetMark) > RotationStacks;
+        if (rearSupport && tooManyMarks)
+            restingMark = targetMark;
+        else if (!rearSupport || restingMark != targetMark || !bot->HasAura(restingMark))
+            restingMark = 0;
+
+        bool const marksNeedRest = tooManyMarks || restingMark != 0;
         Creature* target = bosses[corner];
-        bool const rearNotSettled = reinforcing && corner >= 2 && target &&
+        Creature const* oppositeMarker = rearSupport ? RearMarkSource(bot, bosses, corner ^ 1) : nullptr;
+        bool const rearNotSettled = rearSupport && target &&
             (assignment.handoff || !AtCorner(target, corner) || !OwnsTarget(target, assignment.targetHolder) ||
-             !OutsideRearMark(*target, RearMarkSource(bot, bosses, corner ^ 1)));
-        bool const standby = assignment.standby || marksNeedRest || rearNotSettled;
-        if (standby)
+             !OutsideRearMark(*target, oppositeMarker));
+        bool const standby = assignment.standby || marksNeedRest;
+        if (standby || rearNotSettled)
             target = nullptr;
         bool const pairAlive = target || bosses[corner ^ 1];
         bool const rearHolder = holder && corner >= 2;
@@ -696,6 +705,19 @@ public:
         if (!holder && target && corner == 2 && assignment.supportSlot == NoSupportSlot &&
             !assignment.handoff && AtCorner(target, corner))
             position = target->GetPosition();
+        if (rearNotSettled && !standby)
+        {
+            // A swap or brief loss of aggro pauses attacks. The reinforcements
+            // continue towards the assigned side rather than retracing the room.
+            if (assignment.supportSlot < RearSupport[0].size())
+                position = cornerSpot;
+            else if (bot->GetExactDist(Horsemen[corner].corner) <= RearSupportLocalRange &&
+                OutsideRearMark(*bot, oppositeMarker))
+                position = bot->GetPosition();
+            else
+                position = RearSupport[0][2];
+        }
+        LogRearSupport(rearSupport, marksNeedRest, rearNotSettled, position);
         if (rearHolder && pairAlive)
         {
             position = RearDestination(corner, RearMarkSource(bot, bosses, corner ^ 1));
@@ -785,6 +807,20 @@ public:
     bool HoldingRearCorner() const { return holder && corner >= 2 && corner < CornerCount; }
 
 private:
+    void LogRearSupport(bool rearSupport, bool marksNeedRest, bool rearNotSettled, Position const& position)
+    {
+        uint8 const mode = !rearSupport ? 0 : marksNeedRest ? 3 : rearNotSettled ? 2 : 1;
+        if (mode == rearSupportMode)
+            return;
+        rearSupportMode = mode;
+        if (mode)
+            LOG_INFO("playerbots", "[Naxx40] Horsemen rear support instance={} {} -> {}: {} at ({:.1f}, {:.1f}, {:.2f}) marks={}",
+                bot->GetInstanceId(), bot->GetName(), Horsemen[corner].name,
+                mode == 3 ? "let marks expire" : mode == 2 ? "hold assigned side during handoff" : "resume assigned target",
+                position.GetPositionX(), position.GetPositionY(), position.GetPositionZ(),
+                bot->GetAuraCount(Horsemen[corner].mark));
+    }
+
     Position RearDestination(uint8 corner, Creature const* otherMark)
     {
         Position const& nominal = Horsemen[corner].corner;
@@ -839,6 +875,8 @@ private:
     uint8 corner = NoCorner;
     bool holder = false;
     bool fighting = false;
+    uint32 restingMark = 0;
+    uint8 rearSupportMode = 0;
     std::optional<Position> lastRearDestination;
     FourHorsemen40Hazards hazards;
 };
