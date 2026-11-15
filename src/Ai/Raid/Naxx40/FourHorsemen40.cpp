@@ -14,10 +14,12 @@
 #include "Group.h"
 #include "InstanceScript.h"
 #include "Log.h"
+#include "MoveSpline.h"
 #include "Multiplier.h"
 #include "Naxx40Encounter.h"
 #include "ObjectAccessor.h"
 #include "Playerbots.h"
+#include "SpellAuras.h"
 #include "SpellMgr.h"
 #include "Strategy.h"
 #include "TankRoles.h"
@@ -26,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 namespace
@@ -45,6 +48,9 @@ constexpr float AttackRange = 28.0f;
 constexpr float TauntRange = 29.0f;
 constexpr float PlatformExitZ = 243.5f;
 constexpr float VoidEscapeCornerRadius = 6.0f;
+constexpr float RearCornerRange = 14.0f;
+// The two rear marks have a 45-yard radius. Leave room for combat reach.
+constexpr float RearMarkClearance = 48.0f;
 constexpr uint32 TauntSpell = 355;
 constexpr uint32 DefensiveStance = 71;
 constexpr uint32 BattleStance = 2457;
@@ -78,6 +84,15 @@ std::array<Horseman, CornerCount> const Horsemen = {{
 }};
 
 std::array<Position, 2> const Handoffs = {{{2563.0f, -2993.0f, 241.41f}, {2494.0f, -2920.0f, 241.28f}}};
+// Dry MMAP approaches from the rear exchange point. Try the side that walks
+// around a pool at the nominal corner before the outward pads.
+std::array<std::array<Position, 6>, 2> const RearHolderPads = {{
+    {{{2460.92f, -2947.82f, 241.28f}, {2466.30f, -2950.86f, 241.28f}, {2465.27f, -2951.95f, 241.28f},
+      {2463.55f, -2953.77f, 241.28f}, {2461.14f, -2956.30f, 241.28f}, {2469.62f, -2956.08f, 241.28f}}},
+    {{{2517.95f, -2888.62f, 241.28f}, {2526.28f, -2896.38f, 241.28f}, {2520.90f, -2893.34f, 241.28f},
+      {2521.93f, -2892.25f, 241.28f}, {2523.65f, -2890.43f, 241.28f}, {2525.99f, -2888.06f, 241.28f}}},
+}};
+std::array<uint32, 2> constexpr RearSpirits = {16776, 16777};
 // Each spot is 19 yards from the holder. Pairwise separation is at least 19
 // yards, with clear sight to the holder and no Holy Wrath chain from a settled group.
 std::array<std::array<Position, 4>, 2> const RearSupport = {{
@@ -105,6 +120,9 @@ struct Rotation
     bool handoff = false;
     bool warned = false;
     uint32 changedAt = 0;
+    std::array<bool, 2> rearSettled = {};
+    std::array<bool, 2> rearDecayed = {};
+    bool rearWarned = false;
 };
 
 struct RaidPlan
@@ -325,7 +343,71 @@ bool OwnsTarget(Creature const* boss, ObjectGuid holder)
 
 bool AtCorner(Creature const* boss, uint8 corner)
 {
-    return !boss || boss->GetExactDist(Horsemen[corner].corner) <= BossCornerRange;
+    return !boss || boss->GetExactDist(Horsemen[corner].corner) <= (corner >= 2 ? RearCornerRange : BossCornerRange);
+}
+
+Creature const* RearMarkSource(Player* bot, Bosses const& bosses, uint8 corner)
+{
+    return bosses[corner] ? bosses[corner] : RaidClear::InstanceCreature(bot, {RearSpirits[corner - 2]});
+}
+
+float MarkDistance(Position const& position, Creature const* source)
+{
+    return source ? position.GetExactDist(source) : -1.0f;
+}
+
+bool OutsideRearMark(Position const& position, Creature const* source)
+{
+    return !source || MarkDistance(position, source) >= RearMarkClearance;
+}
+
+void LogRearHolder(Player& tank, Creature const* assigned, Creature const* oldSource, uint8 corner, char const* stage)
+{
+    Position const bossPosition = assigned ? assigned->GetPosition() : Horsemen[corner].corner;
+    Aura const* oldMark = tank.GetAura(Horsemen[corner ^ 1].mark);
+    LOG_INFO("playerbots", "[Naxx40] Horsemen rear instance={} {} {} -> {}{} tank=({:.1f}, {:.1f}, {:.2f}) "
+        "boss=({:.1f}, {:.1f}, {:.2f}) oldDist={:.1f}yd oldStacks={} oldMs={}",
+        tank.GetInstanceId(), stage, tank.GetName(), Horsemen[corner].name, assigned ? "" : " (dead corner)",
+        tank.GetPositionX(), tank.GetPositionY(), tank.GetPositionZ(), bossPosition.GetPositionX(), bossPosition.GetPositionY(),
+        bossPosition.GetPositionZ(), MarkDistance(tank, oldSource), oldMark ? oldMark->GetStackAmount() : 0,
+        oldMark ? oldMark->GetDuration() : 0);
+}
+
+bool MeasureRearRotation(Player& bot, Bosses const& bosses, Rotation& rotation,
+                         std::array<Player*, 2> const& tanks, uint32 now)
+{
+    bool bothSettled = true;
+    bool const warn = rotation.changedAt && !rotation.rearWarned && now - rotation.changedAt >= 16000;
+    for (uint8 index = 0; index < tanks.size(); ++index)
+    {
+        uint8 const corner = 2 + index;
+        Player* tank = tanks[index];
+        if (!tank)
+        {
+            bothSettled = false;
+            continue;
+        }
+
+        Creature const* oldSource = RearMarkSource(&bot, bosses, corner ^ 1);
+        Creature const* assigned = bosses[corner];
+        bool const settled = AtCorner(assigned, corner) && tank->GetExactDist(Horsemen[corner].corner) <= RearCornerRange &&
+            OwnsTarget(assigned, tank->GetGUID()) && OutsideRearMark(*tank, oldSource);
+        bothSettled &= settled;
+        if (rotation.changedAt && settled && !rotation.rearSettled[index])
+        {
+            rotation.rearSettled[index] = true;
+            LogRearHolder(*tank, assigned, oldSource, corner, "corner re-entry");
+        }
+        if (rotation.rearSettled[index] && !rotation.rearDecayed[index] && !tank->HasAura(Horsemen[corner ^ 1].mark))
+        {
+            rotation.rearDecayed[index] = true;
+            LogRearHolder(*tank, assigned, oldSource, corner, "old mark expired");
+        }
+        if (warn && !settled)
+            LogRearHolder(*tank, assigned, oldSource, corner, "corner re-entry pending");
+    }
+    rotation.rearWarned |= warn;
+    return bothSettled;
 }
 
 void UpdateRotation(Player& bot, RaidPlan& plan, Bosses const& bosses, uint8 first, uint32 now)
@@ -338,6 +420,8 @@ void UpdateRotation(Player& bot, RaidPlan& plan, Bosses const& bosses, uint8 fir
     ObjectGuid const holderFirst = plan.holders[AssignedCorner(first, rotation)];
     ObjectGuid const holderSecond = plan.holders[AssignedCorner(second, rotation)];
     bool const owners = OwnsTarget(bosses[first], holderFirst) && OwnsTarget(bosses[second], holderSecond);
+    Player* left = PlayerInRaid(bot, holderFirst);
+    Player* right = PlayerInRaid(bot, holderSecond);
     if (rotation.handoff)
     {
         if (owners)
@@ -345,6 +429,13 @@ void UpdateRotation(Player& bot, RaidPlan& plan, Bosses const& bosses, uint8 fir
             rotation.handoff = false;
             LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} handoff {} / {} secured",
                 bot.GetInstanceId(), Horsemen[first].name, Horsemen[second].name);
+            if (first == 2)
+            {
+                if (left)
+                    LogRearHolder(*left, bosses[first], RearMarkSource(&bot, bosses, second), first, "handoff");
+                if (right)
+                    LogRearHolder(*right, bosses[second], RearMarkSource(&bot, bosses, first), second, "handoff");
+            }
         }
         else if (!rotation.warned && now - rotation.changedAt >= HandoffWarningAfter)
         {
@@ -357,10 +448,9 @@ void UpdateRotation(Player& bot, RaidPlan& plan, Bosses const& bosses, uint8 fir
         return;
     }
 
-    Player* left = PlayerInRaid(bot, holderFirst);
-    Player* right = PlayerInRaid(bot, holderSecond);
-    if (!left || !right || !owners || now - rotation.changedAt < RetryDelay ||
-        !AtCorner(bosses[first], first) || !AtCorner(bosses[second], second))
+    bool const settled = first == 2 ? MeasureRearRotation(bot, bosses, rotation, {left, right}, now) :
+        AtCorner(bosses[first], first) && AtCorner(bosses[second], second);
+    if (!left || !right || !owners || !settled || now - rotation.changedAt < RetryDelay)
         return;
 
     uint32 const leftStacks = left->GetAuraCount(Horsemen[first].mark);
@@ -377,6 +467,9 @@ void UpdateRotation(Player& bot, RaidPlan& plan, Bosses const& bosses, uint8 fir
     rotation.handoff = true;
     rotation.warned = false;
     rotation.changedAt = now;
+    rotation.rearSettled = {};
+    rotation.rearDecayed = {};
+    rotation.rearWarned = false;
     LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} rotation {} / {} from actual stacks {}={} {}={}",
         bot.GetInstanceId(), Horsemen[first].name, Horsemen[second].name,
         left->GetName(), leftStacks, right->GetName(), rightStacks);
@@ -450,11 +543,26 @@ public:
 
         Creature* target = bosses[corner];
         bool const pairAlive = target || bosses[corner ^ 1];
+        bool const rearHolder = holder && corner >= 2;
         uint8 const supportCorner = assignment.handoff ? corner ^ 1 : corner;
         Position const& cornerSpot = !holder && corner >= 2 && assignment.supportSlot < RearSupport[0].size() ?
             RearSupport[supportCorner - 2][assignment.supportSlot] : Horsemen[corner].corner;
-        Position const& position = !holder && assignment.opening ? OpeningCamp :
+        Position position = !holder && assignment.opening ? OpeningCamp :
             pairAlive ? cornerSpot : WaitingPosition;
+        if (rearHolder && pairAlive)
+        {
+            position = RearDestination(corner, RearMarkSource(bot, bosses, corner ^ 1));
+            if (!assignment.handoff && (!lastRearDestination ||
+                lastRearDestination->GetExactDist(position) > CornerArrival))
+            {
+                lastRearDestination = position;
+                LOG_INFO("playerbots", "[Naxx40] Horsemen rear instance={} {} routes to {} pad ({:.2f}, {:.2f}, {:.2f})",
+                    bot->GetInstanceId(), bot->GetName(), Horsemen[corner].name, position.GetPositionX(),
+                    position.GetPositionY(), position.GetPositionZ());
+            }
+            if (assignment.handoff && AI_VALUE(Unit*, "current target") != target)
+                DropAttack();
+        }
         fighting = holder || (target && !assignment.handoff && AtCorner(target, corner) && OwnsTarget(target, assignment.targetHolder));
 
         if (hazards.EscapeVoidZones(*bot, position, VoidEscapeCornerRadius))
@@ -476,9 +584,14 @@ public:
             if (bot->GetExactDist(target) > TauntRange || !bot->IsWithinLOSInMap(target))
             {
                 if (assignment.handoff && bot->GetExactDist(Handoffs[corner / 2]) > CornerArrival)
-                    return WalkTo(Handoffs[corner / 2]);
+                {
+                    if (!rearHolder)
+                        return WalkTo(Handoffs[corner / 2]);
+                    if (WalkTo(Handoffs[corner / 2], true))
+                        return true;
+                }
                 if (!hazards.IsSafeFromVoidZones(*bot, target->GetPosition()))
-                    return WalkTo(position);
+                    return WalkTo(position, rearHolder);
                 return MoveNear(target, bot->IsWithinLOSInMap(target) ? TauntRange - 3.0f : 20.0f,
                     MovementPriority::MOVEMENT_COMBAT);
             }
@@ -496,15 +609,15 @@ public:
             return true;
 
         if (assignment.handoff && holder)
-            return WalkTo(Handoffs[corner / 2]);
+            return WalkTo(Handoffs[corner / 2], rearHolder);
 
         if (!fighting || !target)
         {
             DropAttack();
-            return WalkTo(position);
+            return WalkTo(position, rearHolder);
         }
 
-        if (WalkTo(position))
+        if (WalkTo(position, rearHolder))
             return true;
         if (PlayerbotAI::IsHeal(bot))
             return false;
@@ -524,12 +637,47 @@ public:
     bool HoldingCorner() const { return holder; }
 
 private:
-    bool WalkTo(Position const& position)
+    Position RearDestination(uint8 corner, Creature const* otherMark)
+    {
+        Position const& nominal = Horsemen[corner].corner;
+        Position const* best = nullptr;
+        float bestDistance = -1.0f;
+        auto tryPad = [&](Position const& pad)
+        {
+            if (!hazards.IsSafeFromVoidZones(*bot, pad))
+                return false;
+            float const distance = MarkDistance(pad, otherMark);
+            if (!best || distance > bestDistance)
+            {
+                best = &pad;
+                bestDistance = distance;
+            }
+            return OutsideRearMark(pad, otherMark);
+        };
+
+        if (tryPad(nominal))
+            return nominal;
+        for (Position const& pad : RearHolderPads[corner - 2])
+            if (tryPad(pad))
+                return pad;
+
+        // Advance even if the opposite boss has not cleared the crossing yet.
+        // The next snapshot measures both holders against the actual mark casters.
+        return best ? *best : nominal;
+    }
+
+    bool WalkTo(Position const& position, bool rearHolder = false)
     {
         if (bot->GetExactDist(position) <= CornerArrival || !hazards.IsSafeFromVoidZones(*bot, position))
             return false;
+        if (rearHolder && bot->isMoving() && !bot->movespline->Finalized())
+        {
+            G3D::Vector3 const destination = bot->movespline->FinalDestination();
+            if (position.GetExactDist(destination.x, destination.y, destination.z) <= CornerArrival)
+                return true;
+        }
         return MoveTo(533, position.GetPositionX(), position.GetPositionY(), position.GetPositionZ(),
-            false, false, false, false, MovementPriority::MOVEMENT_COMBAT);
+            false, false, rearHolder, false, MovementPriority::MOVEMENT_COMBAT);
     }
 
     void DropAttack()
@@ -543,6 +691,7 @@ private:
     uint8 corner = NoCorner;
     bool holder = false;
     bool fighting = false;
+    std::optional<Position> lastRearDestination;
     FourHorsemen40Hazards hazards;
 };
 
