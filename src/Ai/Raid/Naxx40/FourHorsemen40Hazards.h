@@ -21,7 +21,7 @@ struct FourHorsemenMarkSource
 class FourHorsemen40Hazards
 {
 public:
-    explicit FourHorsemen40Hazards(PlayerbotAI* ai) : _walk(ai), _markWalk(ai) {}
+    explicit FourHorsemen40Hazards(PlayerbotAI* ai) : _ai(ai), _walk(ai) {}
 
     bool EscapeVoidZones(Player& bot, Position const& corner, float cornerRadius);
     bool IsSafeFromVoidZones(Player& bot, Position const& destination);
@@ -31,11 +31,13 @@ private:
     void RefreshVoidZones(Player& bot);
     float Clearance(Position const& point) const;
 
+    PlayerbotAI* _ai;
     RaidClear::WayOutWalk _walk;
-    RaidClear::WayOutWalk _markWalk;
     std::vector<Position> _voidZones;
     uint32 _instanceId = 0;
     uint32 _checkedAt = 0;
+    uint32 _markSpline = 0;
+    uint32 _markRetryAt = 0;
 };
 
 #endif

@@ -58,9 +58,16 @@ namespace RaidClear
     // The nearest spot, all the way round the bot and from `nearest` to `search` yards from it,
     // where `gapAt` is at least `want`. With nowhere that good, the spot with the widest gap, if
     // that is at least `worthIt` yards more than the bot has where it stands.
-    template <typename GapAt>
+    struct AnyWayOutPath
+    {
+        template <typename Path>
+        bool operator()(Path const&) const { return true; }
+    };
+
+    template <typename GapAt, typename PathAllowed = AnyWayOutPath>
     bool FindWayOut(PlayerbotAI* botAI, Player* bot, GapAt const& gapAt, float want, float worthIt, Position& spot,
-                    float search = WAY_OUT_SEARCH, float nearest = 3.0f)
+                    float search = WAY_OUT_SEARCH, float nearest = 3.0f, PathAllowed const& pathAllowed = {},
+                    Movement::PointsArray* checkedPath = nullptr)
     {
         Map* map = bot->GetMap();
         float const botX = bot->GetPositionX();
@@ -100,12 +107,14 @@ namespace RaidClear
                 if (std::hypot(end.x - x, end.y - y) > WAY_OUT_END_SLACK || path.getPathLength() > ring * 1.5f + 2.0f)
                     continue;
                 float const gap = gapAt(end.x, end.y, end.z);
-                if (gap <= bestGap || leash.Pulls(path.GetPath()))
+                if (gap <= bestGap || !pathAllowed(path.GetPath()) || leash.Pulls(path.GetPath()))
                     continue;
 
                 found = true;
                 bestGap = gap;
                 spot.Relocate(end.x, end.y, end.z);
+                if (checkedPath)
+                    *checkedPath = path.GetPath();
             }
         }
         return found;
