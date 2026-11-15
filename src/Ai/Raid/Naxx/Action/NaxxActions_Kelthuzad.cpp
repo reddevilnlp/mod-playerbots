@@ -9,15 +9,21 @@
 #include "Group.h"
 #include "Map.h"
 #include "MotionMaster.h"
+#include "MoveSpline.h"
+#include "MoveSplineInit.h"
+#include "PathGenerator.h"
 #include "Pet.h"
 #include "PlayerbotAIConfig.h"
 #include "Playerbots.h"
+#include "SpellAuras.h"
 #include "SpellMgr.h"
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <list>
 #include <tuple>
+#include <vector>
 
 namespace
 {
@@ -161,6 +167,224 @@ bool SelectWithoutMelee(Player& bot, AiObjectContext& context, Unit* target)
     context.GetValue<Unit*>("current target")->Set(target);
     return true;
 }
+}
+
+namespace
+{
+    constexpr uint32 ShadowFissureEntry = 16129;
+    constexpr uint32 DetonateMana = 27819;
+    constexpr float FissureDanger = 5.5f;
+    constexpr float FissureSafe = 7.0f;
+    constexpr float DetonationSafe = 12.5f;
+    constexpr float ArenaRadius = 44.0f;
+    constexpr float QuarterTurn = static_cast<float>(M_PI) / 4.0f;
+
+    Movement::PointsArray CheckedEscape(Player& bot, Position const& end, Position const& center,
+                                        float lengthLimit, Creature const* fissure)
+    {
+        if (end.GetExactDist2d(&center) > ArenaRadius)
+            return {};
+        PathGenerator path(&bot);
+        path.SetUseStraightPath(true);
+        constexpr uint32 rejected = PATHFIND_INCOMPLETE | PATHFIND_NOPATH | PATHFIND_SHORTCUT |
+                                    PATHFIND_NOT_USING_PATH | PATHFIND_FARFROMPOLY;
+        if (!path.CalculatePath(end.GetPositionX(), end.GetPositionY(), end.GetPositionZ()) ||
+            !(path.GetPathType() & PATHFIND_NORMAL) || (path.GetPathType() & rejected) ||
+            path.getPathLength() > lengthLimit)
+            return {};
+        auto const& actual = path.GetActualEndPosition();
+        if (end.GetExactDistSq(actual.x, actual.y, actual.z) > 0.75f * 0.75f)
+            return {};
+
+        auto const& points = path.GetPath();
+        float const outerLimit = std::max(ArenaRadius, bot.GetExactDist2d(&center));
+        float const initialFissureGap = fissure ? bot.GetExactDist2d(fissure) : 0.0f;
+        for (std::size_t index = 1; index < points.size(); ++index)
+        {
+            auto const& from = points[index - 1];
+            auto const leg = points[index] - from;
+            int const samples = std::max(1, static_cast<int>(std::ceil(leg.length())));
+            for (int sample = 1; sample <= samples; ++sample)
+            {
+                auto const p = from + leg * (static_cast<float>(sample) / samples);
+                if (center.GetExactDist2d(p.x, p.y) > outerLimit ||
+                    (fissure && fissure->GetExactDist2d(p.x, p.y) + 0.15f <
+                        std::min(initialFissureGap, FissureDanger)))
+                    return {};
+                PositionFullTerrainStatus terrain;
+                bot.GetMap()->GetFullTerrainStatusForPosition(bot.GetPhaseMask(), p.x, p.y, p.z + 0.8f,
+                                                              bot.GetCollisionHeight(), terrain);
+                if (terrain.floorZ <= INVALID_HEIGHT || std::abs(terrain.floorZ - p.z) > 1.0f ||
+                    (terrain.liquidInfo.Status & MAP_LIQUID_STATUS_IN_CONTACT))
+                    return {};
+            }
+        }
+        return points.size() >= 2 ? points : Movement::PointsArray{};
+    }
+
+    Creature const* NearestFissure(Player& bot, Unit const& boss)
+    {
+        // The warning lasts only two seconds. Don't wait for the generic one-second trigger cache.
+        std::list<Creature*> fissures;
+        bot.GetCreatureListWithEntryInGrid(fissures, ShadowFissureEntry, FissureDanger);
+        Creature const* nearest = nullptr;
+        float gap = FissureDanger;
+        for (Creature const* fissure : fissures)
+        {
+            float const distance = bot.GetExactDist2d(fissure);
+            if (fissure->IsAlive() && fissure->InSamePhase(&bot) && fissure->IsSummon() &&
+                fissure->GetSummonerGUID() == boss.GetGUID() && distance <= gap)
+            {
+                nearest = fissure;
+                gap = distance;
+            }
+        }
+        return nearest;
+    }
+
+    bool LaunchEscape(PlayerbotAI& ai, Movement::PointsArray const& path)
+    {
+        Player& bot = *ai.GetBot();
+        if (path.empty() || !ai.CanMove() || bot.GetVehicle())
+            return false;
+
+        auto const& end = path.back();
+        LastMovement& last = ai.GetAiObjectContext()->GetValue<LastMovement&>("last movement")->Get();
+        if (bot.isMoving() && !bot.movespline->Finalized() && last.priority == MovementPriority::MOVEMENT_FORCED &&
+            (bot.movespline->FinalDestination() - end).squaredLength() < 1.0f)
+            return true;
+
+        if (bot.IsSitState())
+            bot.SetStandState(UNIT_STAND_STATE_STAND);
+        bot.CastStop();
+        bot.GetMotionMaster()->Clear();
+        last.clear();
+        Movement::MoveSplineInit init(&bot);
+        init.MovebyPath(path);
+        init.SetWalk(false);
+        int32 const duration = init.Launch();
+        if (duration <= 0)
+            return false;
+        last.Set(bot.GetMapId(), end.x, end.y, end.z, bot.GetOrientation(),
+                 static_cast<float>(duration), MovementPriority::MOVEMENT_FORCED);
+        return true;
+    }
+
+    Position Project(Player const& bot, Position const& origin, float angle, float distance)
+    {
+        float const x = origin.GetPositionX() + std::cos(angle) * distance;
+        float const y = origin.GetPositionY() + std::sin(angle) * distance;
+        return {x, y, bot.GetMapHeight(x, y, bot.GetPositionZ() + 2.0f)};
+    }
+
+    bool EscapeFissure(PlayerbotAI& ai, Creature const& fissure, Position const& center)
+    {
+        Player& bot = *ai.GetBot();
+        float const away = fissure.GetAngle(&bot);
+        for (float turn : {0.0f, QuarterTurn, -QuarterTurn, 2.0f * QuarterTurn, -2.0f * QuarterTurn})
+        {
+            Position const end = Project(bot, fissure, away + turn, FissureSafe);
+            if (end.GetPositionZ() <= INVALID_HEIGHT)
+                continue;
+            if (LaunchEscape(ai, CheckedEscape(bot, end, center, 12.0f, &fissure)))
+                return true;
+        }
+        return false;
+    }
+
+    bool IsolateMana(PlayerbotAI& ai, Aura const& aura, Position const& center)
+    {
+        Player& bot = *ai.GetBot();
+        Group const* group = bot.GetGroup();
+        if (!group || !ai.CanMove() || aura.GetDuration() <= 350)
+            return false;
+
+        std::vector<Player const*> nearby;
+        Player const* closest = nullptr;
+        float closestGap = DetonationSafe;
+        for (GroupReference const* ref = group->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player const* member = ref->GetSource();
+            if (!member || member == &bot || !member->IsAlive() || !member->IsInMap(&bot) ||
+                !member->InSamePhase(&bot) || bot.GetExactDist2d(member) > 36.0f)
+                continue;
+            nearby.push_back(member);
+            float const gap = bot.GetExactDist2d(member);
+            if (gap < closestGap)
+            {
+                closest = member;
+                closestGap = gap;
+            }
+        }
+        if (!closest)
+            return false;
+
+        float const maxWalk = bot.GetSpeed(MOVE_RUN) * (aura.GetDuration() - 350) / 1000.0f;
+        float const away = closest->GetAngle(&bot);
+        for (float distance : {6.0f, 11.0f, 16.0f, 22.0f})
+        {
+            if (distance > maxWalk)
+                break;
+            for (float turn : {0.0f, QuarterTurn, -QuarterTurn, 2.0f * QuarterTurn, -2.0f * QuarterTurn,
+                               3.0f * QuarterTurn, -3.0f * QuarterTurn, 4.0f * QuarterTurn})
+            {
+                Position const end = Project(bot, bot, away + turn, distance);
+                if (end.GetPositionZ() <= INVALID_HEIGHT ||
+                    std::ranges::any_of(nearby, [&](Player const* member)
+                    { return end.GetExactDist2d(member) < DetonationSafe; }))
+                    continue;
+                if (LaunchEscape(ai, CheckedEscape(bot, end, center, maxWalk, nullptr)))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    bool AvoidFrozenMana(PlayerbotAI& ai, Unit const& boss, Position const& center)
+    {
+        Player& bot = *ai.GetBot();
+        if (!bot.GetGroup() || !ai.CanMove())
+            return false;
+
+        Player const* carrier = nullptr;
+        int32 remaining = 0;
+        float nearest = DetonationSafe;
+        for (GroupReference const* ref = bot.GetGroup()->GetFirstMember(); ref; ref = ref->next())
+        {
+            Player const* member = ref->GetSource();
+            if (!member || member == &bot || !member->IsAlive() || !member->IsInMap(&bot) ||
+                !member->InSamePhase(&bot) || !member->HasAura(FrostBlastAura, boss.GetGUID()))
+                continue;
+
+            Aura const* mana = member->GetAura(DetonateMana, boss.GetGUID());
+            float const gap = bot.GetExactDist2d(member);
+            if (mana && mana->GetDuration() > 250 && gap < nearest)
+            {
+                carrier = member;
+                remaining = mana->GetDuration();
+                nearest = gap;
+            }
+        }
+        if (!carrier)
+            return false;
+
+        // A frozen carrier cannot isolate. Move only enough to clear the blast radius.
+        float const away = carrier->GetAngle(&bot);
+        float const maxWalk = std::min(14.0f, bot.GetSpeed(MOVE_RUN) * (remaining - 250) / 1000.0f);
+        for (float turn : {0.0f, QuarterTurn, -QuarterTurn, 2.0f * QuarterTurn, -2.0f * QuarterTurn})
+        {
+            Position const end = Project(bot, *carrier, away + turn, DetonationSafe + 0.75f);
+            if (end.GetPositionZ() > INVALID_HEIGHT &&
+                LaunchEscape(ai, CheckedEscape(bot, end, center, maxWalk, nullptr)))
+                return true;
+        }
+        return false;
+    }
+}
+
+Aura const* KelthuzadBossHelper::Naxx40ManaDetonation() const
+{
+    return IsNaxx40Encounter() ? bot->GetAura(DetonateMana, GetBoss()->GetGUID()) : nullptr;
 }
 
 bool KelthuzadChooseTargetAction::Execute(Event /*event*/)
@@ -357,7 +581,17 @@ bool KelthuzadPositionAction::Execute(Event /*event*/)
     }
     else if (helper.IsPhaseTwo())
     {
-        Unit* shadow_fissure = helper.GetAnyShadowFissure();
+        if (helper.IsNaxx40Encounter())
+        {
+            Position const center(helper.center.first, helper.center.second, bot->GetPositionZ());
+            if (Creature const* fissure = NearestFissure(*bot, *helper.GetBoss()))
+                return EscapeFissure(*botAI, *fissure, center);
+            if (Aura const* mana = helper.Naxx40ManaDetonation())
+                return IsolateMana(*botAI, *mana, center);
+            if (AvoidFrozenMana(*botAI, *helper.GetBoss(), center))
+                return true;
+        }
+        Unit* shadow_fissure = helper.IsNaxx40Encounter() ? nullptr : helper.GetAnyShadowFissure();
         if (!shadow_fissure || !bot->IsWithinDistInMap(shadow_fissure, 10.0f))
         {
             float distance, angle;

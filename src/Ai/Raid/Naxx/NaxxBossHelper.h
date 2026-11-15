@@ -184,6 +184,7 @@ public:
     bool IsNaxx40Encounter() const;
     Unit const* GetBoss() const { return _unit; }
     bool IsNaxx40PhaseOne();
+    Aura const* Naxx40ManaDetonation() const;
     bool InNaxx40Camp(Unit const* member = nullptr) const;
     bool IsNaxx40Incoming(Unit* target) const;
     static bool IsNaxx40Soldier(Unit const* target);

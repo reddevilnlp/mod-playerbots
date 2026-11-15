@@ -220,6 +220,14 @@ float KelthuzadGenericMultiplier::GetValue(Action* action)
 
     if (helper.IsNaxx40Encounter() && helper.IsPhaseTwo())
     {
+        // Volley was still channeling at the end of the two-second Fissure warning.
+        if (dynamic_cast<CastVolleyAction*>(action))
+            return 0.0f;
+        if (helper.Naxx40ManaDetonation() && !dynamic_cast<KelthuzadPositionAction*>(action) &&
+            ((dynamic_cast<MovementAction*>(action) && !dynamic_cast<MeleeAction*>(action)) ||
+             dynamic_cast<CastReachTargetSpellAction*>(action) || action->getName() == "dungeon clear assist camp combat"))
+            return 0.0f;
+
         bool const melee = dynamic_cast<MeleeAction*>(action) || dynamic_cast<CastMeleeSpellAction*>(action);
         bool const chases = dynamic_cast<ReachMeleeAction*>(action) || dynamic_cast<CastReachTargetSpellAction*>(action)
             || dynamic_cast<AttackAction*>(action);
