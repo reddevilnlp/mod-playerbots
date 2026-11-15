@@ -12,6 +12,7 @@
 #include "Patchwerk40.h"
 #include "Player.h"
 #include "PlayerbotAI.h"
+#include "Razuvious40.h"
 #include "Sapphiron40.h"
 #include "Thaddius40.h"
 
@@ -101,8 +102,10 @@ void RaidNaxxStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
     }
 
     // Instructor Razuvious
+    if (naxx40)
+        AddRazuvious40Triggers(triggers);
     triggers.push_back(new TriggerNode("razuvious tank",
-        { NextAction("razuvious use obedience crystal", ACTION_RAID + 1) }
+        { NextAction("razuvious use obedience crystal", ACTION_RAID + (naxx40 ? 5 : 1)) }
     ));
 
     triggers.push_back(new TriggerNode("razuvious nontank",
@@ -170,6 +173,7 @@ void RaidNaxxStrategy::InitMultipliers(std::vector<Multiplier*>& multipliers)
     if (naxx40)
     {
         AddPatchwerk40Multipliers(botAI, multipliers);
+        AddRazuvious40Multipliers(botAI, multipliers);
         AddThaddius40Multipliers(botAI, multipliers);
         AddSapphiron40Multipliers(botAI, multipliers);
     }

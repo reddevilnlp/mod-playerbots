@@ -9,6 +9,7 @@
 
 #include "NamedObjectContext.h"
 #include "NaxxTriggers.h"
+#include "Razuvious40.h"
 
 class RaidNaxxTriggerContext : public NamedObjectContext<Trigger>
 {
@@ -29,6 +30,7 @@ public:
 
         creators["razuvious tank"] = &RaidNaxxTriggerContext::razuvious_tank;
         creators["razuvious nontank"] = &RaidNaxxTriggerContext::razuvious_nontank;
+        creators["razuvious40 mana burn positioning"] = &CreateRazuvious40PositionTrigger;
 
         creators["four horsemen attractors"] = &RaidNaxxTriggerContext::four_horsemen_attractors;
         creators["four horsemen except attractors"] = &RaidNaxxTriggerContext::four_horsemen_except_attractors;

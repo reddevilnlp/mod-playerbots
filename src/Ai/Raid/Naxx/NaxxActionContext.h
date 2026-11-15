@@ -10,6 +10,7 @@
 #include "Action.h"
 #include "NamedObjectContext.h"
 #include "NaxxActions.h"
+#include "Razuvious40.h"
 
 class RaidNaxxActionContext : public NamedObjectContext<Action>
 {
@@ -31,6 +32,7 @@ public:
 
         creators["razuvious use obedience crystal"] = &RaidNaxxActionContext::razuvious_use_obedience_crystal;
         creators["razuvious target"] = &RaidNaxxActionContext::razuvious_target;
+        creators["razuvious40 mana burn position"] = &CreateRazuvious40PositionAction;
 
         creators["four horsemen attract alternatively"] = &RaidNaxxActionContext::four_horsemen_attract_alternatively;
         creators["four horsemen attack in order"] = &RaidNaxxActionContext::four_horsemen_attack_in_order;
