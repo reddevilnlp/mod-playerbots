@@ -19,11 +19,19 @@
 #include <cmath>
 #include <limits>
 
+namespace
+{
+    constexpr uint32 UnholyAxe = 351061;
+    constexpr uint32 AxeWhirlwindAura = 24236;
+    constexpr uint32 AxeWhirlwindDamage = 15589;
+    constexpr uint32 CaptainWhirlwind = 28335;
+}
+
 bool IsNaxx40MilitaryTrash(Unit const& unit)
 {
     // Includes unmodified Death Touched Warrior and Death Lord spawns in the lower corridor.
     constexpr std::array entries = {Naxx40DeathknightCaptain, 351049u, 351050u, 351051u, 351052u, 351053u, 351054u,
-        351055u, Naxx40ShadeOfNaxxramas, 351057u, 351058u, 351060u, 351061u, 351062u, 351063u, 16157u, 16158u, 16861u};
+        351055u, Naxx40ShadeOfNaxxramas, 351057u, 351058u, 351060u, UnholyAxe, 351062u, 351063u, 16157u, 16158u, 16861u};
     return std::ranges::find(entries, unit.GetEntry()) != entries.end() && IsNaxx40Map(unit.FindMap());
 }
 
@@ -46,22 +54,30 @@ bool MayPetAttackNaxx40MilitaryTrash(Player const& owner, Unit const& target)
 
 namespace
 {
-    constexpr char NearCaptain[] = "naxx40 military captain too close";
+    constexpr char NearWhirlwind[] = "naxx40 military whirlwind too close";
     constexpr char StayClear[] = "naxx40 military stay clear";
-    constexpr float CaptainSearch = 40.0f;
+    constexpr float WhirlwindSearch = 40.0f;
     constexpr float FloorBand = 5.0f;
     constexpr float MovementMargin = 1.0f;
 
-    float WhirlwindRadius()
+    struct WhirlwindSource
     {
-        // The spell deals instant weapon damage and stuns the target, so start clear before the cast.
-        static float const radius = []
+        Unit const* unit;
+        float radius;
+        bool active;
+    };
+
+    float WhirlwindRadius(uint32 entry)
+    {
+        auto const readRadius = [](uint32 spellId)
         {
-            SpellInfo const* info = sSpellMgr->GetSpellInfo(28335);
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
             float const yards = info ? info->Effects[EFFECT_0].CalcRadius() : 0.0f;
             return yards > 0.0f ? yards : 8.0f;
-        }();
-        return radius;
+        };
+        static float const captainRadius = readRadius(CaptainWhirlwind);
+        static float const axeRadius = readRadius(AxeWhirlwindDamage);
+        return entry == UnholyAxe ? axeRadius : captainRadius;
     }
 
     bool NeedsRangedSpace(Player* bot)
@@ -69,93 +85,97 @@ namespace
         return PlayerbotAI::IsHeal(bot) || !PlayerbotAI::IsMelee(bot);
     }
 
-    std::vector<Unit const*> Captains(PlayerbotAI* ai, Player* bot)
+    std::vector<WhirlwindSource> WhirlwindSources(PlayerbotAI* ai, Player* bot)
     {
-        std::vector<Unit const*> captains;
+        std::vector<WhirlwindSource> sources;
         if (!IsNaxx40Map(bot->FindMap()) || !bot->GetGroup() || PlayerbotAI::IsTank(bot))
-            return captains;
+            return sources;
 
         for (ObjectGuid const& guid : ai->GetAiObjectContext()->GetValue<GuidVector>("attackers")->Get())
         {
-            Unit const* captain = ai->GetUnit(guid);
-            if (!captain || captain->GetEntry() != Naxx40DeathknightCaptain || !captain->IsAlive() ||
-                !captain->IsInCombat() || !bot->IsValidAttackTarget(captain) ||
-                bot->GetExactDist(captain) > CaptainSearch)
+            Unit const* enemy = ai->GetUnit(guid);
+            if (!enemy || (enemy->GetEntry() != Naxx40DeathknightCaptain && enemy->GetEntry() != UnholyAxe) ||
+                !enemy->IsAlive() || !enemy->IsInCombat() || !bot->IsValidAttackTarget(enemy) ||
+                bot->GetExactDist(enemy) > WhirlwindSearch)
                 continue;
-            captains.push_back(captain);
+            bool const active = enemy->GetEntry() == UnholyAxe && enemy->HasAura(AxeWhirlwindAura);
+            sources.push_back({enemy, WhirlwindRadius(enemy->GetEntry()), active});
         }
-        return captains;
+        return sources;
     }
 
-    // A melee DPS avoids overlap between captains. Healers and ranged keep clear of each one.
-    float CaptainDistance(std::vector<Unit const*> const& captains, bool ranged, float x, float y, float z)
+    // Ranged and healers keep clear from the start. Melee avoid overlapping
+    // attacks and step away from a single Axe during its ticking aura.
+    float WhirlwindGap(std::vector<WhirlwindSource> const& sources, bool ranged, float x, float y, float z)
     {
         float nearest = std::numeric_limits<float>::max();
         float second = nearest;
-        for (Unit const* captain : captains)
+        float active = nearest;
+        for (auto const& source : sources)
         {
-            if (std::abs(captain->GetPositionZ() - z) > FloorBand)
+            if (std::abs(source.unit->GetPositionZ() - z) > FloorBand)
                 continue;
-            float const distance = captain->GetExactDist2d(x, y);
-            second = std::min(second, std::max(nearest, distance));
-            nearest = std::min(nearest, distance);
+            float const gap = source.unit->GetExactDist2d(x, y) - source.radius;
+            second = std::min(second, std::max(nearest, gap));
+            nearest = std::min(nearest, gap);
+            if (source.active)
+                active = std::min(active, gap);
         }
-        return ranged ? nearest : second;
+        return ranged ? nearest : std::min(active, second);
     }
 
-    float CaptainDistance(std::vector<Unit const*> const& captains, bool ranged, Unit const& unit)
+    float WhirlwindGap(std::vector<WhirlwindSource> const& sources, bool ranged, Unit const& unit)
     {
-        return CaptainDistance(captains, ranged, unit.GetPositionX(), unit.GetPositionY(), unit.GetPositionZ());
+        return WhirlwindGap(sources, ranged, unit.GetPositionX(), unit.GetPositionY(), unit.GetPositionZ());
     }
 
-    float MinimumDistance(bool ranged)
+    float MinimumGap(bool ranged)
     {
-        return WhirlwindRadius() + (ranged ? 2.0f : MovementMargin);
+        return ranged ? 2.0f : MovementMargin;
     }
 
-    class CaptainProximityTrigger final : public Trigger
+    class WhirlwindProximityTrigger final : public Trigger
     {
     public:
-        explicit CaptainProximityTrigger(PlayerbotAI* ai) : Trigger(ai, NearCaptain) {}
+        explicit WhirlwindProximityTrigger(PlayerbotAI* ai) : Trigger(ai, NearWhirlwind) {}
 
         bool IsActive() override
         {
             if (!bot->IsAlive() || !botAI->CanMove())
                 return false;
             bool const ranged = NeedsRangedSpace(bot);
-            return CaptainDistance(Captains(botAI, bot), ranged, *bot) < MinimumDistance(ranged);
+            return WhirlwindGap(WhirlwindSources(botAI, bot), ranged, *bot) < MinimumGap(ranged);
         }
     };
 
-    class StayClearOfCaptainsAction final : public Action
+    class StayClearOfWhirlwindAction final : public Action
     {
     public:
-        explicit StayClearOfCaptainsAction(PlayerbotAI* ai) : Action(ai, StayClear), _walk(ai) {}
+        explicit StayClearOfWhirlwindAction(PlayerbotAI* ai) : Action(ai, StayClear), _walk(ai) {}
 
         bool Execute(Event /*event*/) override
         {
-            auto const captains = Captains(botAI, bot);
+            auto const sources = WhirlwindSources(botAI, bot);
             bool const ranged = NeedsRangedSpace(bot);
-            float const keepAway = MinimumDistance(ranged);
-            if (CaptainDistance(captains, ranged, *bot) >= keepAway)
+            float const keepAway = MinimumGap(ranged);
+            if (WhirlwindGap(sources, ranged, *bot) >= keepAway)
                 return false;
 
-            auto const distanceAt = [&captains, ranged](float x, float y, float z)
+            auto const gapAt = [&sources, ranged](float x, float y, float z)
             {
-                return CaptainDistance(captains, ranged, x, y, z);
+                return WhirlwindGap(sources, ranged, x, y, z);
             };
-            return _walk.Go(distanceAt, keepAway, WhirlwindRadius() + (ranged ? 4.0f : 2.0f),
-                            MovementMargin, 15.0f, ranged && captains.size() == 1);
+            return _walk.Go(gapAt, keepAway, ranged ? 4.0f : 2.0f, MovementMargin, 15.0f, sources.size() == 1);
         }
 
     private:
         RaidClear::WayOutWalk _walk;
     };
 
-    class CaptainSpacingMultiplier final : public Multiplier
+    class WhirlwindSpacingMultiplier final : public Multiplier
     {
     public:
-        explicit CaptainSpacingMultiplier(PlayerbotAI* ai) : Multiplier(ai, "naxx40 military captain spacing") {}
+        explicit WhirlwindSpacingMultiplier(PlayerbotAI* ai) : Multiplier(ai, "naxx40 military whirlwind spacing") {}
 
         float GetValue(Action* action) override
         {
@@ -170,13 +190,13 @@ namespace
             if (!follow && !melee)
                 return 1.0f;
 
-            auto const captains = Captains(botAI, bot);
-            bool const ranged = NeedsRangedSpace(bot);
-            if (captains.empty() || (!ranged && captains.size() < 2))
+            auto const sources = WhirlwindSources(botAI, bot);
+            if (sources.empty())
                 return 1.0f;
 
+            bool const ranged = NeedsRangedSpace(bot);
             Unit const* target = follow ? RaidClear::KillOrderMarker(bot->GetGroup()) : action->GetTarget();
-            return target && CaptainDistance(captains, ranged, *target) < MinimumDistance(ranged) ? 0.0f : 1.0f;
+            return target && WhirlwindGap(sources, ranged, *target) < MinimumGap(ranged) ? 0.0f : 1.0f;
         }
     };
 
@@ -188,25 +208,25 @@ namespace
 
         void InitTriggers(std::vector<TriggerNode*>& triggers) override
         {
-            triggers.push_back(new TriggerNode(NearCaptain, {NextAction(StayClear, ACTION_EMERGENCY + 3)}));
+            triggers.push_back(new TriggerNode(NearWhirlwind, {NextAction(StayClear, ACTION_EMERGENCY + 3)}));
             triggers.push_back(new TriggerNode("rc kill order", {NextAction("rc mark kill order", ACTION_RAID + 2)}));
         }
 
         void InitMultipliers(std::vector<Multiplier*>& multipliers) override
         {
-            multipliers.push_back(new CaptainSpacingMultiplier(botAI));
+            multipliers.push_back(new WhirlwindSpacingMultiplier(botAI));
         }
     };
 }
 
 Naxx40MilitaryActionContext::Naxx40MilitaryActionContext()
 {
-    creators[StayClear] = [](PlayerbotAI* ai) { return new StayClearOfCaptainsAction(ai); };
+    creators[StayClear] = [](PlayerbotAI* ai) { return new StayClearOfWhirlwindAction(ai); };
 }
 
 Naxx40MilitaryTriggerContext::Naxx40MilitaryTriggerContext()
 {
-    creators[NearCaptain] = [](PlayerbotAI* ai) { return new CaptainProximityTrigger(ai); };
+    creators[NearWhirlwind] = [](PlayerbotAI* ai) { return new WhirlwindProximityTrigger(ai); };
 }
 
 Naxx40MilitaryStrategyContext::Naxx40MilitaryStrategyContext()
