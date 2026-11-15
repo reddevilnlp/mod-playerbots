@@ -39,6 +39,7 @@ constexpr char EncounterTrigger[] = "four horsemen 40 active";
 constexpr uint32 Encounter = 12;
 constexpr uint8 CornerCount = 4;
 constexpr uint8 NoCorner = CornerCount;
+constexpr uint8 NoSupportSlot = 5;
 constexpr uint32 RotationStacks = 2;
 constexpr uint32 SnapshotInterval = 200;
 constexpr uint32 RetryDelay = 5000;
@@ -94,13 +95,13 @@ std::array<std::array<Position, 6>, 2> const RearHolderPads = {{
       {2521.93f, -2892.25f, 241.28f}, {2523.65f, -2890.43f, 241.28f}, {2525.99f, -2888.06f, 241.28f}}},
 }};
 std::array<uint32, 2> constexpr RearSpirits = {16776, 16777};
-// Each spot is 19 yards from the holder. Pairwise separation is at least 19
-// yards, with clear sight to the holder and no Holy Wrath chain from a settled group.
-std::array<std::array<Position, 4>, 2> const RearSupport = {{
+// The four starting spots are 19 yards from the holder. Use the last slot
+// only for a reinforcement after filling the established formation.
+std::array<std::array<Position, NoSupportSlot>, 2> const RearSupport = {{
     {{{2459.90f, -2931.15f, 241.28f}, {2469.40f, -2966.60f, 241.28f},
-      {2488.40f, -2947.60f, 241.28f}, {2478.90f, -2931.15f, 241.28f}}},
+      {2488.40f, -2947.60f, 241.28f}, {2478.90f, -2931.15f, 241.28f}, {2478.90f, -2964.05f, 241.28f}}},
     {{{2501.35f, -2887.10f, 241.28f}, {2536.80f, -2896.60f, 241.28f},
-      {2501.35f, -2906.10f, 241.28f}, {2527.30f, -2913.05f, 241.28f}}},
+      {2501.35f, -2906.10f, 241.28f}, {2527.30f, -2913.05f, 241.28f}, {2511.85f, -2918.82f, 241.28f}}},
 }};
 Position const RoomCenter(2540.0f, -2955.0f, 241.30f);
 Position const WaitingPosition(2535.0f, -2941.0f, 241.48f);
@@ -112,7 +113,9 @@ struct Member
 {
     ObjectGuid guid;
     uint8 home;
-    uint8 supportSlot = 4;
+    uint8 supportSlot = NoSupportSlot;
+    uint8 assignedCorner = NoCorner;
+    uint8 assignedSlot = NoSupportSlot;
 };
 
 struct Rotation
@@ -140,11 +143,13 @@ struct RaidPlan
 struct Assignment
 {
     uint8 corner = NoCorner;
-    uint8 supportSlot = 4;
+    uint8 supportSlot = NoSupportSlot;
     bool holder = false;
     bool handoff = false;
     bool opening = false;
     ObjectGuid targetHolder;
+    bool standby = false;
+    bool redirected = false;
 };
 
 std::mutex PlansMutex;
@@ -337,6 +342,132 @@ uint8 AssignedCorner(uint8 home, Rotation const& rotation)
     return rotation.flipped ? home ^ 1 : home;
 }
 
+void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
+{
+    struct Candidate
+    {
+        Member& member;
+        Player* player;
+        uint8 homeCorner;
+        uint8 corner = NoCorner;
+        uint8 slot = NoSupportSlot;
+        bool healer = false;
+    };
+    std::vector<Candidate> support;
+    support.reserve(plan.members.size());
+    std::array<uint8, CornerCount> healerCount = {};
+    std::array<uint32, CornerCount> occupiedSlots = {};
+    std::array<bool, CornerCount> liveHolder = {};
+    for (uint8 corner = 0; corner < CornerCount; ++corner)
+        liveHolder[corner] = bosses[corner] &&
+            PlayerInRaid(bot, plan.holders[AssignedCorner(corner, plan.rotations[corner / 2])]);
+
+    auto occupy = [&](Candidate& candidate, uint8 corner, uint8 slot)
+    {
+        if (candidate.corner != NoCorner)
+        {
+            healerCount[candidate.corner] -= candidate.healer;
+            if (candidate.slot < NoSupportSlot)
+                occupiedSlots[candidate.corner] &= ~(1u << candidate.slot);
+        }
+        candidate.corner = corner;
+        candidate.slot = slot;
+        healerCount[corner] += candidate.healer;
+        if (slot < NoSupportSlot)
+            occupiedSlots[corner] |= 1u << slot;
+    };
+
+    for (Member& member : plan.members)
+    {
+        Player* player = PlayerInRaid(bot, member.guid);
+        if (!player || member.home == NoCorner || plan.holders[member.home] == member.guid)
+            continue;
+
+        uint8 const corner = AssignedCorner(member.home, plan.rotations[member.home / 2]);
+        Candidate& candidate = support.emplace_back(Candidate{member, player, corner});
+        candidate.healer = PlayerbotAI::IsHeal(player);
+        if (bosses[corner] && (corner < 2 || (member.supportSlot < NoSupportSlot &&
+            !(occupiedSlots[corner] & (1u << member.supportSlot)))))
+            occupy(candidate, corner, member.supportSlot);
+    }
+
+    auto freeSlot = [&](uint8 corner, bool healer)
+    {
+        if (corner >= 2)
+            for (uint8 slot = healer ? 0 : 2; slot < (healer ? 2 : NoSupportSlot); ++slot)
+                if (!(occupiedSlots[corner] & (1u << slot)))
+                    return slot;
+        return NoSupportSlot;
+    };
+
+    // First cover every living holder. A healer already at a living corner can
+    // move only if their group has a second healer.
+    for (uint8 minimum : std::array<uint8, 2>{1, 2})
+        for (uint8 corner = 0; corner < CornerCount; ++corner)
+        {
+            if (!liveHolder[corner] || healerCount[corner] >= minimum)
+                continue;
+            uint8 const slot = freeSlot(corner, true);
+            if (corner >= 2 && slot == NoSupportSlot)
+                continue;
+
+            Candidate* choice = nullptr;
+            auto priority = [corner](Candidate const& candidate)
+            {
+                return (candidate.corner != NoCorner ? 2 : 0) + (candidate.member.assignedCorner != corner);
+            };
+            for (Candidate& candidate : support)
+                if (candidate.healer && candidate.corner != corner &&
+                    (candidate.corner == NoCorner || (minimum == 1 && healerCount[candidate.corner] > 1)) &&
+                    (!choice || priority(candidate) < priority(*choice)))
+                    choice = &candidate;
+            if (choice)
+                occupy(*choice, corner, slot);
+        }
+
+    uint8 sharedBlaumeuxRanged = 0;
+    for (Candidate& candidate : support)
+    {
+        if (candidate.healer || candidate.corner != NoCorner)
+            continue;
+
+        uint8 const opposite = candidate.homeCorner ^ 1;
+        if (opposite < 2 && liveHolder[opposite])
+            occupy(candidate, opposite, NoSupportSlot);
+        else if (liveHolder[0] || liveHolder[1])
+            occupy(candidate, liveHolder[0] ? 0 : 1, NoSupportSlot);
+        else if (PlayerbotAI::IsRangedDps(candidate.player))
+        {
+            for (uint8 corner : std::array<uint8, 2>{2, 3})
+                if (liveHolder[corner])
+                    if (uint8 const slot = freeSlot(corner, false); slot != NoSupportSlot)
+                    {
+                        occupy(candidate, corner, slot);
+                        break;
+                    }
+            // Blaumeux can take a full ranged group. Reserve the individual
+            // spacing restriction for Zeliek, where Holy Wrath bounces.
+            if (candidate.corner == NoCorner && liveHolder[2])
+                occupy(candidate, 2, 2 + sharedBlaumeuxRanged++ % (NoSupportSlot - 2));
+        }
+        else if (liveHolder[2])
+            occupy(candidate, 2, NoSupportSlot);
+    }
+
+    for (Candidate const& candidate : support)
+    {
+        Member& member = candidate.member;
+        if (candidate.corner != NoCorner && candidate.corner != candidate.homeCorner &&
+            (member.assignedCorner != candidate.corner || member.assignedSlot != candidate.slot))
+            LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} support reassigned {} ({}) {} -> {}{}",
+                bot.GetInstanceId(), candidate.player->GetName(), candidate.healer ? "healer" : "dps",
+                Horsemen[candidate.homeCorner].name, Horsemen[candidate.corner].name,
+                candidate.healer ? " for tank coverage" : " after losing the assigned target");
+        member.assignedCorner = candidate.corner;
+        member.assignedSlot = candidate.slot;
+    }
+}
+
 bool OwnsTarget(Creature const* boss, ObjectGuid holder)
 {
     return !boss || (!holder.IsEmpty() && boss->GetVictim() && boss->GetVictim()->GetGUID() == holder);
@@ -501,6 +632,7 @@ Assignment AssignmentFor(Player& bot, Bosses const& bosses)
         }
         UpdateRotation(bot, plan, bosses, 0, now);
         UpdateRotation(bot, plan, bosses, 2, now);
+        AllocateSupport(bot, plan, bosses);
         for (uint8 corner = 0; corner < CornerCount; ++corner)
         {
             Creature* boss = bosses[corner];
@@ -517,11 +649,13 @@ Assignment AssignmentFor(Player& bot, Bosses const& bosses)
     if (member == plan.members.end() || member->home == NoCorner)
         return {};
 
-    Rotation const& rotation = plan.rotations[member->home / 2];
-    uint8 const corner = AssignedCorner(member->home, rotation);
-    return {corner, member->supportSlot, plan.holders[member->home] == bot.GetGUID(), rotation.handoff,
-            corner >= 2 && !plan.rearReleased,
-            plan.holders[member->home]};
+    bool const holder = plan.holders[member->home] == bot.GetGUID();
+    uint8 const homeCorner = AssignedCorner(member->home, plan.rotations[member->home / 2]);
+    bool const standby = !holder && member->assignedCorner == NoCorner;
+    uint8 const corner = holder || standby ? homeCorner : member->assignedCorner;
+    Rotation const& rotation = plan.rotations[corner / 2];
+    return {corner, member->assignedSlot, holder, rotation.handoff, corner >= 2 && !plan.rearReleased,
+            plan.holders[AssignedCorner(corner, rotation)], standby, corner != homeCorner};
 }
 
 class FourHorsemen40Action final : public AttackAction
@@ -542,14 +676,26 @@ public:
         if (corner == NoCorner)
             return false;
 
+        bool const reinforcing = assignment.redirected && !PlayerbotAI::IsHeal(bot);
+        bool const marksNeedRest = reinforcing &&
+            bot->GetAuraCount(Horsemen[corner].mark) > RotationStacks;
         Creature* target = bosses[corner];
+        bool const rearNotSettled = reinforcing && corner >= 2 && target &&
+            (assignment.handoff || !AtCorner(target, corner) || !OwnsTarget(target, assignment.targetHolder) ||
+             !OutsideRearMark(*target, RearMarkSource(bot, bosses, corner ^ 1)));
+        bool const standby = assignment.standby || marksNeedRest || rearNotSettled;
+        if (standby)
+            target = nullptr;
         bool const pairAlive = target || bosses[corner ^ 1];
         bool const rearHolder = holder && corner >= 2;
-        uint8 const supportCorner = assignment.handoff ? corner ^ 1 : corner;
+        uint8 const supportCorner = assignment.handoff && !assignment.redirected ? corner ^ 1 : corner;
         Position const& cornerSpot = !holder && corner >= 2 && assignment.supportSlot < RearSupport[0].size() ?
             RearSupport[supportCorner - 2][assignment.supportSlot] : Horsemen[corner].corner;
         Position position = !holder && assignment.opening ? OpeningCamp :
-            pairAlive ? cornerSpot : WaitingPosition;
+            !standby && pairAlive ? cornerSpot : WaitingPosition;
+        if (!holder && target && corner == 2 && assignment.supportSlot == NoSupportSlot &&
+            !assignment.handoff && AtCorner(target, corner))
+            position = target->GetPosition();
         if (rearHolder && pairAlive)
         {
             position = RearDestination(corner, RearMarkSource(bot, bosses, corner ^ 1));
