@@ -75,8 +75,11 @@ constexpr float RearSupportLocalRange = 28.0f;
 constexpr float HealerCoverageRange = 35.0f;
 constexpr float HealerCoverageMana = 10.0f;
 constexpr float SupportTransferRange = 40.0f;
+constexpr float MeteorSoakRange = 8.0f;
+constexpr uint8 MinimumMeteorSoak = 5;
 // The two rear marks have a 45-yard radius. Leave room for combat reach.
 constexpr float RearMarkClearance = 48.0f;
+constexpr float FrontMarkClearance = 58.0f;
 constexpr uint32 TauntSpell = 355;
 constexpr uint32 DefensiveStance = 71;
 constexpr uint32 BattleStance = 2457;
@@ -111,6 +114,9 @@ std::array<Horseman, CornerCount> const Horsemen = {{
 }};
 
 std::array<Position, 2> const Handoffs = {{{2563.0f, -2993.0f, 241.41f}, {2494.0f, -2920.0f, 241.28f}}};
+// Both dry paths from the front exchange keep the marks apart even when
+// the two riders stop within melee reach of their tanks.
+std::array<Position, 2> const FrontHolderPads = {{{2534.5f, -3014.7f, 241.33f}, {2591.5f, -2964.0f, 241.3401f}}};
 // Dry MMAP approaches from the rear exchange point. Try the side that walks
 // around a pool at the nominal corner before the outward pads.
 std::array<std::array<Position, 6>, 2> const RearHolderPads = {{
@@ -131,6 +137,7 @@ std::array<std::array<Position, NoSupportSlot>, 2> const RearSupport = {{
 Position const RoomCenter(2540.0f, -2955.0f, 241.30f);
 Position const WaitingPosition(2535.0f, -2941.0f, 241.48f);
 Position const OpeningCamp(2555.9f, -2996.4f, 241.4f);
+std::array<Position, 2> const FrontSupportPads = {{{2537.5f, -3015.5f, 241.34f}, {2588.0f, -2968.0f, 241.34f}}};
 Position const MograinePullPoint(2538.50f, -2970.00f, 241.2943f);
 
 struct OpeningFlank
@@ -210,9 +217,9 @@ struct Rotation
     bool handoff = false;
     bool warned = false;
     uint32 changedAt = 0;
-    std::array<bool, 2> rearSettled = {};
-    std::array<bool, 2> rearDecayed = {};
-    bool rearWarned = false;
+    std::array<bool, 2> settled = {};
+    std::array<bool, 2> decayed = {};
+    bool settlingWarned = false;
 };
 
 struct RaidPlan
@@ -1001,6 +1008,12 @@ float MarkRadius(uint8 corner)
     return corner < 2 ? 55.0f : 45.0f;
 }
 
+Position const& FrontSupportPosition(uint8 corner, Player* player)
+{
+    return PlayerbotAI::IsHeal(player) || PlayerbotAI::IsRangedDps(player) ?
+        FrontSupportPads[corner] : FrontHolderPads[corner];
+}
+
 void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
 {
     struct Candidate
@@ -1015,6 +1028,8 @@ void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
         bool leaveForMarks = false;
         bool authorizedToLeave = false;
         bool earlyRearHealer = false;
+        bool earlyFrontSupport = false;
+        bool urgentMarks = false;
     };
     std::vector<Candidate> support;
     support.reserve(plan.members.size());
@@ -1222,9 +1237,11 @@ void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
     {
         return casters[mark] && position.GetExactDist(casters[mark]) < MarkRadius(mark) + 3.0f;
     };
-    auto supportPosition = [](uint8 corner, uint8 slot) -> Position const&
+    auto supportPosition = [](uint8 corner, uint8 slot, Player* player) -> Position const&
     {
-        return corner >= 2 && slot < NoSupportSlot ? RearSupport[corner - 2][slot] : Horsemen[corner].corner;
+        if (corner < 2)
+            return FrontSupportPosition(corner, player);
+        return slot < NoSupportSlot ? RearSupport[corner - 2][slot] : Horsemen[corner].corner;
     };
     auto clearsMarks = [&](Position const& position, uint8 marks)
     {
@@ -1234,31 +1251,43 @@ void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
         return true;
     };
 
+    bool const frontReady = plan.reached[0] && plan.reached[1];
     bool const rearReady = plan.rearReleased && plan.reached[2] && plan.reached[3];
     for (Candidate& candidate : support)
     {
-        candidate.earlyRearHealer = !plan.individualArmed && candidate.healer &&
+        candidate.earlyFrontSupport = !plan.individualArmed &&
+            ((frontReady && candidate.corner < 2) || (candidate.homeCorner < 2 && candidate.member.clearingMarks));
+        candidate.earlyRearHealer = !plan.individualArmed && !candidate.earlyFrontSupport && candidate.healer &&
             (candidate.member.clearingMarks || (rearReady && candidate.corner >= 2 && candidate.corner < CornerCount));
-        if (!plan.individualArmed && !candidate.earlyRearHealer)
+        if (!plan.individualArmed && !candidate.earlyRearHealer && !candidate.earlyFrontSupport)
             continue;
         Position const& destination = candidate.corner == NoCorner ? candidate.player->GetPosition() :
-            supportPosition(candidate.corner, candidate.slot);
+            supportPosition(candidate.corner, candidate.slot, candidate.player);
         uint8 doubled = 0;
+        uint8 clearsAtNextPad = 0;
+        bool unsafeAtNextPad = false;
         for (uint8 mark = 0; mark < CornerCount; ++mark)
         {
             uint32 const stacks = candidate.player->GetAuraCount(Horsemen[mark].mark);
-            if (stacks && (candidate.member.clearingMarks & (1u << mark)))
-            {
-                candidate.marks |= 1u << mark;
-                candidate.leaveForMarks = true;
-            }
-            if (stacks < RotationStacks || (!isWithinMark(destination, mark) && !isWithinMark(*candidate.player, mark)))
+            uint8 const mask = 1u << mark;
+            bool const stillClearing = stacks && (candidate.member.clearingMarks & mask);
+            bool const inNextMark = isWithinMark(destination, mark);
+            if (!stillClearing &&
+                (stacks < RotationStacks || (!inNextMark && !isWithinMark(*candidate.player, mark))))
                 continue;
-            candidate.marks |= 1u << mark;
-            ++doubled;
-            candidate.leaveForMarks |= stacks > RotationStacks;
+            candidate.marks |= mask;
+            if (!inNextMark)
+                clearsAtNextPad |= mask;
+            else if (stillClearing || stacks > RotationStacks)
+                unsafeAtNextPad = true;
+            doubled += stacks >= RotationStacks;
+            candidate.leaveForMarks |= stillClearing || stacks > RotationStacks;
+            candidate.urgentMarks |= stacks > RotationStacks + 1;
         }
         candidate.leaveForMarks |= doubled >= 2;
+        // A normal swap can clear an old mark while taking two stacks on the new side.
+        if (candidate.earlyFrontSupport && clearsAtNextPad && !unsafeAtNextPad)
+            candidate.marks = clearsAtNextPad;
     }
 
     auto coveringHealer = [&](uint8 corner, Candidate const& leaving) -> Candidate const*
@@ -1283,6 +1312,17 @@ void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
         return corner == NoCorner || !tanks[corner] || coveringHealer(corner, leaving);
     };
 
+    Unit const* meteorTarget = !plan.individualArmed && bosses[0] ? bosses[0]->GetVictim() : nullptr;
+    auto isMeteorSoaker = [&](Candidate const& candidate)
+    {
+        return meteorTarget && candidate.player != meteorTarget && candidate.corner == 0 &&
+            (!candidate.member.clearingMarks || candidate.member.assignedCorner == candidate.corner) &&
+            candidate.player->GetExactDist(meteorTarget) <= MeteorSoakRange;
+    };
+    auto remainingSoak = std::count_if(support.begin(), support.end(), isMeteorSoaker);
+    if (meteorTarget)
+        ++remainingSoak;
+
     std::array<bool, CornerCount> departureThisSnapshot = {};
     for (Candidate& candidate : support)
     {
@@ -1292,7 +1332,13 @@ void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
         bool const startingRearRelief = candidate.earlyRearHealer && from >= 2 && from < CornerCount &&
             !candidate.member.clearingMarks;
         if (startingRearRelief && (plan.rotations[1].handoff ||
-            clearsMarks(supportPosition(from, candidate.slot), candidate.marks)))
+            clearsMarks(supportPosition(from, candidate.slot, candidate.player), candidate.marks)))
+        {
+            candidate.leaveForMarks = false;
+            continue;
+        }
+        if (candidate.earlyFrontSupport && from < 2 && plan.rotations[0].handoff &&
+            !candidate.member.clearingMarks && !candidate.urgentMarks)
         {
             candidate.leaveForMarks = false;
             continue;
@@ -1318,7 +1364,7 @@ void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
                 };
                 auto readyToRelieve = [&](Candidate const& donor)
                 {
-                    if (!candidate.earlyRearHealer)
+                    if (!candidate.earlyRearHealer && !candidate.earlyFrontSupport)
                         return true;
                     if (donor.corner != NoCorner && plan.rotations[donor.corner / 2].handoff)
                         return false;
@@ -1338,7 +1384,7 @@ void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
                 if (spare)
                 {
                     occupy(*spare, from, slot);
-                    if (candidate.earlyRearHealer)
+                    if (candidate.earlyRearHealer || candidate.earlyFrontSupport)
                     {
                         // Keep the incoming healer with this tank while they get into casting range.
                         spare->member.coveringTank = tanks[from]->GetGUID();
@@ -1372,15 +1418,27 @@ void AllocateSupport(Player& bot, RaidPlan& plan, Bosses const& bosses)
                 candidate.player->GetAuraCount(Horsemen[to].mark) >= RotationStacks ||
                 (to >= 2 && (slot == NoSupportSlot || (!candidate.healer && !PlayerbotAI::IsRangedDps(candidate.player)))))
                 return false;
-            Position const& destination = supportPosition(to, slot);
+            Position const& destination = supportPosition(to, slot, candidate.player);
             return candidate.player->GetExactDist(destination) <= SupportTransferRange && clearsMarks(destination, candidate.marks);
         };
         uint8 const prior = candidate.member.assignedCorner;
         uint8 const priorSlot = candidate.member.assignedSlot;
         bool const retainPrior = candidate.member.clearingMarks && prior != from &&
             canTransfer(prior, priorSlot) && (prior < 2 || !occupiedSlots[prior][priorSlot]);
-        if (!retainPrior && from != NoCorner && clearsMarks(supportPosition(from, candidate.slot), candidate.marks))
+        if (!retainPrior && from != NoCorner &&
+            clearsMarks(supportPosition(from, candidate.slot, candidate.player), candidate.marks))
             continue;
+
+        // Let the cohort make its normal swap before peeling a soaker off Korth'azz.
+        if (candidate.earlyFrontSupport && isMeteorSoaker(candidate))
+        {
+            if (remainingSoak <= MinimumMeteorSoak)
+            {
+                candidate.leaveForMarks = false;
+                continue;
+            }
+            --remainingSoak;
+        }
 
         if (candidate.healer && !candidate.member.clearingMarks)
             if (Candidate const* cover = coveringHealer(from, candidate))
@@ -1448,7 +1506,8 @@ bool OwnsTarget(Creature const* boss, ObjectGuid holder)
 
 bool AtCorner(Creature const* boss, uint8 corner)
 {
-    return !boss || boss->GetExactDist(Horsemen[corner].corner) <= (corner >= 2 ? RearCornerRange : BossCornerRange);
+    Position const& pad = corner < 2 ? FrontHolderPads[corner] : Horsemen[corner].corner;
+    return !boss || boss->GetExactDist(pad) <= (corner < 2 ? BossCornerRange : RearCornerRange);
 }
 
 Creature const* RearMarkSource(Player* bot, Bosses const& bosses, uint8 corner)
@@ -1466,26 +1525,27 @@ bool OutsideRearMark(Position const& position, Creature const* source)
     return !source || MarkDistance(position, source) >= RearMarkClearance;
 }
 
-void LogRearHolder(Player& tank, Creature const* assigned, Creature const* oldSource, uint8 corner, char const* stage)
+void LogHolderRotation(Player& tank, Creature const* assigned, Creature const* oldSource, uint8 corner, char const* stage)
 {
     Position const bossPosition = assigned ? assigned->GetPosition() : Horsemen[corner].corner;
     Aura const* oldMark = tank.GetAura(Horsemen[corner ^ 1].mark);
-    LOG_INFO("playerbots", "[Naxx40] Horsemen rear instance={} {} {} -> {}{} tank=({:.1f}, {:.1f}, {:.2f}) "
+    LOG_INFO("playerbots", "[Naxx40] Horsemen {} instance={} {} {} -> {}{} tank=({:.1f}, {:.1f}, {:.2f}) "
         "boss=({:.1f}, {:.1f}, {:.2f}) oldDist={:.1f}yd oldStacks={} oldMs={}",
-        tank.GetInstanceId(), stage, tank.GetName(), Horsemen[corner].name, assigned ? "" : " (dead corner)",
+        corner < 2 ? "front" : "rear", tank.GetInstanceId(), stage, tank.GetName(), Horsemen[corner].name,
+        assigned ? "" : " (dead corner)",
         tank.GetPositionX(), tank.GetPositionY(), tank.GetPositionZ(), bossPosition.GetPositionX(), bossPosition.GetPositionY(),
         bossPosition.GetPositionZ(), MarkDistance(tank, oldSource), oldMark ? oldMark->GetStackAmount() : 0,
         oldMark ? oldMark->GetDuration() : 0);
 }
 
-bool MeasureRearRotation(Player& bot, Bosses const& bosses, Rotation& rotation,
-                         std::array<Player*, 2> const& tanks, uint32 now)
+bool MeasureHolderRotation(Player& bot, Bosses const& bosses, Rotation& rotation, uint8 first,
+    std::array<Player*, 2> const& tanks, uint32 now)
 {
     bool bothSettled = true;
-    bool const warn = rotation.changedAt && !rotation.rearWarned && now - rotation.changedAt >= 16000;
+    bool const warn = rotation.changedAt && !rotation.settlingWarned && now - rotation.changedAt >= 16000;
     for (uint8 index = 0; index < tanks.size(); ++index)
     {
-        uint8 const corner = 2 + index;
+        uint8 const corner = first + index;
         Player* tank = tanks[index];
         if (!tank)
         {
@@ -1493,25 +1553,30 @@ bool MeasureRearRotation(Player& bot, Bosses const& bosses, Rotation& rotation,
             continue;
         }
 
-        Creature const* oldSource = RearMarkSource(&bot, bosses, corner ^ 1);
+        uint8 const oldMark = corner ^ 1;
+        Creature const* oldSource = MarkCaster(&bot, bosses, oldMark);
         Creature const* assigned = bosses[corner];
-        bool const settled = AtCorner(assigned, corner) && tank->GetExactDist(Horsemen[corner].corner) <= RearCornerRange &&
-            OwnsTarget(assigned, tank->GetGUID()) && OutsideRearMark(*tank, oldSource);
+        bool const front = corner < 2;
+        Position const& pad = front ? FrontHolderPads[corner] : Horsemen[corner].corner;
+        float const padRange = front ? CornerArrival + 1.0f : RearCornerRange;
+        float const markClearance = front ? FrontMarkClearance : RearMarkClearance;
+        bool const settled = AtCorner(assigned, corner) && tank->GetExactDist(pad) <= padRange &&
+            OwnsTarget(assigned, tank->GetGUID()) && (!oldSource || MarkDistance(*tank, oldSource) >= markClearance);
         bothSettled &= settled;
-        if (rotation.changedAt && settled && !rotation.rearSettled[index])
+        if (rotation.changedAt && settled && !rotation.settled[index])
         {
-            rotation.rearSettled[index] = true;
-            LogRearHolder(*tank, assigned, oldSource, corner, "corner re-entry");
+            rotation.settled[index] = true;
+            LogHolderRotation(*tank, assigned, oldSource, corner, "corner re-entry");
         }
-        if (rotation.rearSettled[index] && !rotation.rearDecayed[index] && !tank->HasAura(Horsemen[corner ^ 1].mark))
+        if (rotation.settled[index] && !rotation.decayed[index] && !tank->HasAura(Horsemen[oldMark].mark))
         {
-            rotation.rearDecayed[index] = true;
-            LogRearHolder(*tank, assigned, oldSource, corner, "old mark expired");
+            rotation.decayed[index] = true;
+            LogHolderRotation(*tank, assigned, oldSource, corner, "old mark expired");
         }
         if (warn && !settled)
-            LogRearHolder(*tank, assigned, oldSource, corner, "corner re-entry pending");
+            LogHolderRotation(*tank, assigned, oldSource, corner, "corner re-entry pending");
     }
-    rotation.rearWarned |= warn;
+    rotation.settlingWarned |= warn;
     return bothSettled;
 }
 
@@ -1534,13 +1599,10 @@ void UpdateRotation(Player& bot, RaidPlan& plan, Bosses const& bosses, uint8 fir
             rotation.handoff = false;
             LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} handoff {} / {} secured",
                 bot.GetInstanceId(), Horsemen[first].name, Horsemen[second].name);
-            if (first == 2)
-            {
-                if (left)
-                    LogRearHolder(*left, bosses[first], RearMarkSource(&bot, bosses, second), first, "handoff");
-                if (right)
-                    LogRearHolder(*right, bosses[second], RearMarkSource(&bot, bosses, first), second, "handoff");
-            }
+            if (left)
+                LogHolderRotation(*left, bosses[first], MarkCaster(&bot, bosses, second), first, "handoff");
+            if (right)
+                LogHolderRotation(*right, bosses[second], MarkCaster(&bot, bosses, first), second, "handoff");
         }
         else if (!rotation.warned && now - rotation.changedAt >= HandoffWarningAfter)
         {
@@ -1553,8 +1615,7 @@ void UpdateRotation(Player& bot, RaidPlan& plan, Bosses const& bosses, uint8 fir
         return;
     }
 
-    bool const settled = first == 2 ? MeasureRearRotation(bot, bosses, rotation, {left, right}, now) :
-        AtCorner(bosses[first], first) && AtCorner(bosses[second], second);
+    bool const settled = MeasureHolderRotation(bot, bosses, rotation, first, {left, right}, now);
     if (!left || !right || !owners || !settled || now - rotation.changedAt < RetryDelay)
         return;
 
@@ -1562,10 +1623,11 @@ void UpdateRotation(Player& bot, RaidPlan& plan, Bosses const& bosses, uint8 fir
     uint32 const rightStacks = right->GetAuraCount(Horsemen[second].mark);
     bool const needSwap = (bosses[first] && leftStacks >= RotationStacks) ||
         (bosses[second] && rightStacks >= RotationStacks);
-    // A newly entered corner may apply its mark on the way across the floor. Wait
-    // for the mark of the corner being left to fall before reversing again.
-    if (!needSwap || left->GetAuraCount(Horsemen[second].mark) >= RotationStacks ||
-        right->GetAuraCount(Horsemen[first].mark) >= RotationStacks)
+    // Wait out the old front marks before another crossing. A rear holder may
+    // still carry one stack while standing outside the old marker's radius.
+    uint32 const maxOldStacks = first == 0 ? 0 : RotationStacks - 1;
+    if (!needSwap || left->GetAuraCount(Horsemen[second].mark) > maxOldStacks ||
+        right->GetAuraCount(Horsemen[first].mark) > maxOldStacks)
         return;
 
     if (first == 2 && !rotation.changedAt && bosses[first] &&
@@ -1576,9 +1638,9 @@ void UpdateRotation(Player& bot, RaidPlan& plan, Bosses const& bosses, uint8 fir
     rotation.handoff = true;
     rotation.warned = false;
     rotation.changedAt = now;
-    rotation.rearSettled = {};
-    rotation.rearDecayed = {};
-    rotation.rearWarned = false;
+    rotation.settled = {};
+    rotation.decayed = {};
+    rotation.settlingWarned = false;
     LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} rotation {} / {} from actual stacks {}={} {}={}",
         bot.GetInstanceId(), Horsemen[first].name, Horsemen[second].name,
         left->GetName(), leftStacks, right->GetName(), rightStacks);
@@ -1741,6 +1803,10 @@ public:
             RearSupport[supportCorner - 2][assignment.supportSlot] : Horsemen[corner].corner;
         Position position = !holder && assignment.opening ? OpeningCamp :
             !standby && pairAlive ? cornerSpot : WaitingPosition;
+        if (holder && corner < 2 && pairAlive)
+            position = FrontHolderPads[corner];
+        if (!holder && corner < 2 && !standby && pairAlive)
+            position = FrontSupportPosition(corner, bot);
         if (corner >= 2 && assignment.stagedHealer)
             position = OpeningFlanks[corner - 2].healers[assignment.supportSlot];
         if (assignment.standby && assignment.followsReceivingGroup && corner == 3 &&
@@ -1808,20 +1874,11 @@ public:
             if (bot->GetExactDist(target) > TauntRange || !bot->IsWithinLOSInMap(target))
             {
                 if (assignment.handoff && bot->GetExactDist(Handoffs[corner / 2]) > CornerArrival)
-                {
-                    if (!rearHolder)
-                        return WalkTo(Handoffs[corner / 2]);
                     if (WalkTo(Handoffs[corner / 2], true))
                         return true;
-                }
                 if (rearHolder && assignment.stagedTank && WalkTo(OpeningFlanks[corner - 2].pull, true))
                     return true;
-                if (rearHolder)
-                    return hazards.ApproachRear(*bot, *target, TauntRange, CornerArrival) || WalkTo(position, true);
-                if (!hazards.IsSafeFromVoidZones(*bot, target->GetPosition()))
-                    return WalkTo(position, rearHolder);
-                return MoveNear(target, bot->IsWithinLOSInMap(target) ? TauntRange - 3.0f : 20.0f,
-                    MovementPriority::MOVEMENT_COMBAT);
+                return hazards.ApproachRear(*bot, *target, TauntRange, CornerArrival) || WalkTo(position, true);
             }
 
             return AI_VALUE(Unit*, "current target") != target && Attack(target);
@@ -1837,15 +1894,15 @@ public:
             return true;
 
         if (assignment.handoff && holder)
-            return WalkTo(Handoffs[corner / 2], rearHolder);
+            return WalkTo(Handoffs[corner / 2], true);
 
         if (!fighting || !target)
         {
             DropAttack();
-            return WalkTo(position, rearHolder);
+            return WalkTo(position, holder);
         }
 
-        if (WalkTo(position, rearHolder))
+        if (WalkTo(position, holder))
             return true;
         if (PlayerbotAI::IsHeal(bot))
             return false;
@@ -1924,9 +1981,9 @@ private:
         return best ? *best : nominal;
     }
 
-    bool WalkTo(Position const& position, bool rearHolder = false)
+    bool WalkTo(Position const& position, bool checkedGround = false)
     {
-        if (rearHolder)
+        if (checkedGround)
             return hazards.WalkRear(*bot, position, CornerArrival);
         if (bot->GetExactDist(position) <= CornerArrival || !hazards.IsSafeFromVoidZones(*bot, position))
             return false;
@@ -2142,12 +2199,6 @@ bool FourHorsemen40::SuppressTankWorldBuff(Player& player, uint32 spellId)
     using namespace Patchwerk40TankSupplies;
     if (!IsNaxx40Map(player.FindMap()) || !player.GetGroup() || !CanAssign(&player, player))
         return false;
-    InstanceScript const* instance = player.GetInstanceScript();
-    if (!instance)
-        return false;
-    EncounterState const state = instance->GetBossState(Encounter);
-    if (state != NOT_STARTED && state != IN_PROGRESS)
-        return false;
     SpellInfo const* spell = sSpellMgr->GetSpellInfo(spellId);
     if (!spell || spellId == FlaskAura || spellId == FoodAura)
         return false;
@@ -2159,7 +2210,18 @@ bool FourHorsemen40::SuppressTankWorldBuff(Player& player, uint32 spellId)
         SpellGroupStackRule const rule = sSpellMgr->CheckSpellGroupStackRules(spell, desired);
         return rule == SPELL_GROUP_STACK_RULE_EXCLUSIVE || rule == SPELL_GROUP_STACK_RULE_EXCLUSIVE_FROM_SAME_CASTER;
     };
-    if (!conflicts(FlaskAura) && !conflicts(FoodAura))
+    bool const conflictsFlask = conflicts(FlaskAura);
+    bool const conflictsFood = conflicts(FoodAura);
+    if (!conflictsFlask && !conflictsFood)
+        return false;
+    if ((conflictsFlask && player.HasAura(FlaskAura)) || (conflictsFood && player.HasAura(FoodAura)))
+        return true;
+
+    InstanceScript const* instance = player.GetInstanceScript();
+    if (!instance)
+        return false;
+    EncounterState const state = instance->GetBossState(Encounter);
+    if (state != NOT_STARTED && state != IN_PROGRESS)
         return false;
 
     std::lock_guard<std::mutex> lock(PlansMutex);
