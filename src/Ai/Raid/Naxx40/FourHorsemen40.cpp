@@ -14,6 +14,7 @@
 #include "GenericSpellActions.h"
 #include "Group.h"
 #include "InstanceScript.h"
+#include "Item.h"
 #include "LastMovementValue.h"
 #include "Log.h"
 #include "Map.h"
@@ -23,14 +24,17 @@
 #include "Multiplier.h"
 #include "Naxx40Encounter.h"
 #include "ObjectAccessor.h"
+#include "Patchwerk40.h"
 #include "PathGenerator.h"
 #include "Playerbots.h"
 #include "SpellAuras.h"
+#include "SpellAuraEffects.h"
 #include "SpellMgr.h"
 #include "Strategy.h"
 #include "TankRoles.h"
 #include "ThreatManager.h"
 #include "Timer.h"
+#include "UseItemAction.h"
 
 #include <algorithm>
 #include <array>
@@ -51,6 +55,11 @@ constexpr uint32 RotationStacks = 2;
 constexpr uint32 SnapshotInterval = 200;
 constexpr uint32 RetryDelay = 5000;
 constexpr uint32 HandoffWarningAfter = 10000;
+constexpr uint32 ShadowProtectionItem = 13459;
+constexpr uint32 ShadowProtectionAura = 17548;
+constexpr uint32 TankSuppliesWaitMs = 20000;
+constexpr uint32 ShadowProtectionWaitMs = 2500;
+constexpr uint32 ItemRetryMs = 1000;
 constexpr float CornerArrival = 2.0f;
 constexpr float BossCornerRange = 9.0f;
 constexpr float AttackRange = 28.0f;
@@ -154,12 +163,23 @@ struct OpeningPlan
 {
     ObjectGuid leader;
     std::vector<OpeningMember> members;
+    std::array<uint32, CornerCount> suppliesAttempt{};
+    uint32 suppliesStarted = 0;
+    bool suppliesChecked = false;
     uint32 lastDrive = 0;
     uint32 lastReport = 0;
     uint32 pullRequestedAt = 0;
     uint8 firstTag = NoCorner;
     uint8 readyFlanks = 0;
     bool pulled = false;
+};
+
+struct RearProtection
+{
+    ObjectGuid tank;
+    uint32 startedAt = 0;
+    uint32 attemptedAt = 0;
+    int32 remaining = -1;
 };
 
 struct Member
@@ -196,6 +216,7 @@ struct RaidPlan
     bool rearReleased = false;
     bool individualArmed = false;
     std::optional<OpeningPlan> opening;
+    RearProtection rearProtection;
 };
 
 struct Assignment
@@ -466,6 +487,119 @@ void StartOpening(Player& leader, RaidPlan& plan, uint32 now)
         leader.GetInstanceId(), opening.members.size());
 }
 
+class HorsemenTankConsumable final : public UseItemAction
+{
+public:
+    explicit HorsemenTankConsumable(PlayerbotAI* ai) : UseItemAction(ai, "horsemen tank consumable", true) {}
+
+    bool Use(uint32 itemId)
+    {
+        if (bot->isMoving() || bot->IsMounted() || bot->IsNonMeleeSpellCast(false) || !botAI->CanMove())
+            return false;
+        Item* item = bot->GetItemByEntry(itemId);
+        if (!item || bot->HasSpellCooldown(item->GetTemplate()->Spells[0].SpellId))
+            return false;
+        return UseItemAuto(item);
+    }
+};
+
+bool PrepareTankSupplies(Player& leader, RaidPlan const& plan, OpeningPlan& opening, uint32 now)
+{
+    using namespace Patchwerk40TankSupplies;
+    if (opening.suppliesChecked)
+        return true;
+    if (!opening.suppliesStarted)
+        opening.suppliesStarted = now;
+
+    uint8 ready = 0;
+    bool pending = false;
+    for (uint8 corner = 0; corner < CornerCount; ++corner)
+    {
+        Player* tank = PlayerInRaid(leader, plan.holders[corner]);
+        if (!tank)
+            continue;
+        bool const flask = HasTimeRemaining(*tank, FlaskAura, MinimumFlaskMs);
+        bool const food = HasTimeRemaining(*tank, FoodAura, MinimumFoodMs);
+        if (flask && food)
+        {
+            ++ready;
+            continue;
+        }
+        uint32 const item = !flask && tank->HasItemCount(FlaskItem, 1) ? FlaskItem :
+            !food && !tank->HasAura(EatingAura) && tank->HasItemCount(FoodItem, 1) ? FoodItem : 0;
+        pending |= item || (!food && tank->HasAura(EatingAura));
+        uint32& last = opening.suppliesAttempt[corner];
+        if (item && (!last || now - last >= ItemRetryMs))
+        {
+            last = now;
+            HorsemenTankConsumable(GET_PLAYERBOT_AI(tank)).Use(item);
+        }
+    }
+
+    if (pending && now - opening.suppliesStarted < TankSuppliesWaitMs)
+        return false;
+    opening.suppliesChecked = true;
+    for (ObjectGuid holder : plan.holders)
+        if (Player* tank = PlayerInRaid(leader, holder))
+            LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} tank {} supplies flask={} food={} health={}/{}",
+                leader.GetInstanceId(), tank->GetName(), tank->HasAura(FlaskAura), tank->HasAura(FoodAura),
+                tank->GetHealth(), tank->GetMaxHealth());
+    LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} tank supplies confirmed {}/{}",
+        leader.GetInstanceId(), ready, CornerCount);
+    return true;
+}
+
+bool ConfirmFirstShadowProtection(Player& tank, RearProtection& protection, uint32 now)
+{
+    if (protection.tank != tank.GetGUID())
+    {
+        protection = {};
+        protection.tank = tank.GetGUID();
+        protection.startedAt = now;
+    }
+    if (AuraEffect const* absorb = tank.GetAuraEffect(ShadowProtectionAura, EFFECT_0))
+    {
+        protection.remaining = absorb->GetAmount();
+        LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} {} Shadow Protection before first rear swap "
+            "remaining={} health={}/{} form={} usedPotion={}", tank.GetInstanceId(), tank.GetName(),
+            protection.remaining, tank.GetHealth(), tank.GetMaxHealth(), uint32(tank.GetShapeshiftForm()),
+            tank.GetLastPotionId());
+        return true;
+    }
+    if ((!protection.attemptedAt && (!tank.HasItemCount(ShadowProtectionItem, 1) ||
+         tank.GetLastPotionId() || tank.HasSpellCooldown(ShadowProtectionAura))) ||
+        now - protection.startedAt >= ShadowProtectionWaitMs)
+    {
+        LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} {} first rear swap without Shadow Protection "
+            "(items={}, usedPotion={})", tank.GetInstanceId(), tank.GetName(),
+            tank.GetItemCount(ShadowProtectionItem), tank.GetLastPotionId());
+        return true;
+    }
+    if (!tank.GetLastPotionId() && (!protection.attemptedAt || now - protection.attemptedAt >= ItemRetryMs))
+    {
+        protection.attemptedAt = now;
+        HorsemenTankConsumable(GET_PLAYERBOT_AI(&tank)).Use(ShadowProtectionItem);
+    }
+    return false;
+}
+
+void MeasureShadowProtection(Player& bot, RearProtection& protection)
+{
+    if (protection.remaining < 0)
+        return;
+    Player* tank = ObjectAccessor::GetPlayer(bot, protection.tank);
+    if (!tank)
+        return;
+    AuraEffect const* absorb = tank->GetAuraEffect(ShadowProtectionAura, EFFECT_0);
+    int32 const remaining = absorb ? absorb->GetAmount() : -1;
+    if (remaining == protection.remaining)
+        return;
+    LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} {} Shadow Protection {} remaining={} previous={} "
+        "health={}/{}", bot.GetInstanceId(), tank->GetName(), absorb ? "active" : "ended", remaining,
+        protection.remaining, tank->GetHealth(), tank->GetMaxHealth());
+    protection.remaining = remaining;
+}
+
 bool OutsideOpeningAggro(Player const& member, Bosses const& bosses, G3D::Vector3 const& from,
     G3D::Vector3 const& to, float margin)
 {
@@ -563,6 +697,8 @@ FourHorsemen40::Preparation DriveOpening(Player& leader, RaidPlan& plan, Bosses 
 {
     OpeningPlan& opening = *plan.opening;
     opening.lastDrive = now;
+    if (!PrepareTankSupplies(leader, plan, opening, now))
+        return FourHorsemen40::Preparation::Staging;
     if (std::any_of(bosses.begin(), bosses.end(), [](Creature const* boss) { return !boss || boss->IsInCombat(); }))
     {
         opening.readyFlanks = 0;
@@ -1279,6 +1415,10 @@ void UpdateRotation(Player& bot, RaidPlan& plan, Bosses const& bosses, uint8 fir
         right->GetAuraCount(Horsemen[first].mark) >= RotationStacks)
         return;
 
+    if (first == 2 && !rotation.changedAt && bosses[first] &&
+        !ConfirmFirstShadowProtection(*right, plan.rearProtection, now))
+        return;
+
     rotation.flipped = !rotation.flipped;
     rotation.handoff = true;
     rotation.warned = false;
@@ -1319,6 +1459,7 @@ Assignment AssignmentFor(Player& bot, Bosses const& bosses)
     if (!plan.sampledAt || now - plan.sampledAt >= SnapshotInterval)
     {
         plan.sampledAt = now;
+        MeasureShadowProtection(bot, plan.rearProtection);
         SelectHolders(bot, plan);
         if (!plan.individualArmed)
             for (uint8 corner = 0; corner < CornerCount; ++corner)
