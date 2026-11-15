@@ -25,7 +25,7 @@ public:
 
     bool EscapeVoidZones(Player& bot, Position const& corner, float cornerRadius);
     bool IsSafeFromVoidZones(Player& bot, Position const& destination);
-    bool WalkRear(Player& bot, Position const& destination, float arrival, bool detour = true);
+    bool WalkRear(Player& bot, Position const& destination, float arrival, bool detour = true, float maxPathLength = 0.0f);
     bool ApproachRear(Player& bot, Unit const& target, float range, float arrival);
     bool EscapeMarks(Player& bot, std::span<FourHorsemenMarkSource const> sources);
 

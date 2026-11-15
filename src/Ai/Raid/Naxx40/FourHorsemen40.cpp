@@ -28,6 +28,7 @@
 #include "Patchwerk40.h"
 #include "PathGenerator.h"
 #include "Playerbots.h"
+#include "Spell.h"
 #include "SpellAuras.h"
 #include "SpellAuraEffects.h"
 #include "SpellMgr.h"
@@ -82,9 +83,14 @@ constexpr float HealerCoverageMana = 10.0f;
 constexpr float SupportTransferRange = 40.0f;
 constexpr float MeteorSoakRange = 8.0f;
 constexpr uint8 MinimumMeteorSoak = 5;
+constexpr uint32 KorthMeteor = 28884;
+constexpr float MeteorHoldRadius = 6.75f;
+constexpr float MeteorApproachRadius = 5.75f;
+constexpr uint32 MeteorArrivalMarginMs = 150;
 // The two rear marks have a 45-yard radius. Leave room for combat reach.
 constexpr float RearMarkClearance = 48.0f;
 constexpr float FrontMarkClearance = 58.0f;
+constexpr float FrontRotationBossRange = 15.0f;
 constexpr uint32 TauntSpell = 355;
 constexpr uint32 ShootRangedWeapon = 3018;
 constexpr uint32 Bloodrage = 2687;
@@ -1668,7 +1674,11 @@ bool MeasureHolderRotation(Player& bot, Bosses const& bosses, Rotation& rotation
         Position const& pad = front ? FrontHolderPads[corner] : Horsemen[corner].corner;
         float const padRange = front ? CornerArrival + 1.0f : RearCornerRange;
         float const markClearance = front ? FrontMarkClearance : RearMarkClearance;
-        bool const settled = AtCorner(assigned, corner) && tank->GetExactDist(pad) <= padRange &&
+        // A front rider can follow its tank from the inner edge of the corner.
+        // The handoff is safe once the holder and the opposite mark are clear.
+        bool const inCorner = front ?
+            !assigned || assigned->GetExactDist(pad) <= FrontRotationBossRange : AtCorner(assigned, corner);
+        bool const settled = inCorner && tank->GetExactDist(pad) <= padRange &&
             OwnsTarget(assigned, tank->GetGUID()) && (!oldSource || MarkDistance(*tank, oldSource) >= markClearance);
         bothSettled &= settled;
         if (rotation.changedAt && settled && !rotation.settled[index])
@@ -1732,11 +1742,10 @@ void UpdateRotation(Player& bot, RaidPlan& plan, Bosses const& bosses, uint8 fir
     uint32 const rightStacks = right->GetAuraCount(Horsemen[second].mark);
     bool const needSwap = (bosses[first] && leftStacks >= RotationStacks) ||
         (bosses[second] && rightStacks >= RotationStacks);
-    // Wait out the old front marks before another crossing. A rear holder may
-    // still carry one stack while standing outside the old marker's radius.
-    uint32 const maxOldStacks = first == 0 ? 0 : RotationStacks - 1;
-    if (!needSwap || left->GetAuraCount(Horsemen[second].mark) > maxOldStacks ||
-        right->GetAuraCount(Horsemen[first].mark) > maxOldStacks)
+    // A rider drifting during the exchange can refresh one old mark. Once
+    // both holders are clear of its actual radius, a single stack is safe.
+    if (!needSwap || left->GetAuraCount(Horsemen[second].mark) >= RotationStacks ||
+        right->GetAuraCount(Horsemen[first].mark) >= RotationStacks)
         return;
 
     if (first == 2 && !rotation.changedAt && bosses[first] &&
@@ -1915,6 +1924,8 @@ Assignment AssignmentFor(Player& bot, Bosses const& bosses)
 
 class FourHorsemen40Action final : public AttackAction
 {
+    enum class MeteorResponse { Ignore, Hold, Move };
+
 public:
     explicit FourHorsemen40Action(PlayerbotAI* ai) : AttackAction(ai, TacticsAction), hazards(ai) {}
 
@@ -2016,13 +2027,25 @@ public:
                     bot->GetInstanceId(), bot->GetName(), Horsemen[corner].name, position.GetPositionX(),
                     position.GetPositionY(), position.GetPositionZ());
             }
-            if (assignment.handoff && AI_VALUE(Unit*, "current target") != target)
+        }
+        if (holder && target)
+        {
+            Unit const* const victim = bot->GetVictim();
+            Unit const* const cachedTarget = AI_VALUE(Unit*, "current target");
+            if ((victim && victim != target) || (cachedTarget && cachedTarget != target))
                 DropAttack();
         }
         fighting = holder || (target && !assignment.handoff && AtCorner(target, corner) && OwnsTarget(target, assignment.targetHolder));
 
         if (hazards.EscapeVoidZones(*bot, position, VoidEscapeCornerRadius))
             return true;
+
+        if (MeteorResponse const meteor = RespondToMeteor(assignment, bosses); meteor != MeteorResponse::Ignore)
+        {
+            DropAttack();
+            fighting = false;
+            return meteor == MeteorResponse::Move;
+        }
 
         if (assignment.rearSideHealer)
         {
@@ -2121,6 +2144,82 @@ public:
     bool HoldingRearCorner() const { return holder && corner >= 2 && corner < CornerCount; }
 
 private:
+    MeteorResponse RespondToMeteor(Assignment const& assignment, Bosses const& bosses)
+    {
+        Creature const* korth = bosses[0];
+        if (!korth || assignment.holder || assignment.corner >= 2 || assignment.standby || assignment.clearingMarks)
+            return MeteorResponse::Ignore;
+        Spell* const cast = korth->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+        if (!cast || cast->GetSpellInfo()->Id != KorthMeteor || cast->getState() != SPELL_STATE_PREPARING ||
+            !cast->m_targets.HasDst())
+            return MeteorResponse::Ignore;
+
+        Position const& impact = *cast->m_targets.GetDstPos();
+        float const distance = bot->GetExactDist(impact);
+        if (assignment.corner != 0 && !assignment.handoff && distance > MeteorSoakRange + CornerArrival)
+            return MeteorResponse::Ignore;
+        auto safeToSoak = [&](Position const& point)
+        {
+            uint8 nearbyMarks = 0;
+            for (uint8 mark = 0; mark < CornerCount; ++mark)
+            {
+                uint32 const stacks = bot->GetAuraCount(Horsemen[mark].mark);
+                if (stacks < RotationStacks)
+                    continue;
+                if (Creature const* source = MarkCaster(bot, bosses, mark);
+                    source && point.GetExactDist(source) < MarkRadius(mark) + CornerArrival &&
+                    (stacks > RotationStacks || ++nearbyMarks >= 2))
+                    return false;
+            }
+            return hazards.IsSafeFromVoidZones(*bot, point);
+        };
+        if (distance <= MeteorHoldRadius)
+        {
+            if (!safeToSoak(bot->GetPosition()))
+                return MeteorResponse::Ignore;
+            if (bot->isMoving())
+                bot->StopMoving();
+            return MeteorResponse::Hold;
+        }
+
+        int32 const remaining = cast->GetCastTimeRemaining();
+        if (remaining <= int32(MeteorArrivalMarginMs))
+            return MeteorResponse::Ignore;
+        float const maxWalk = bot->GetSpeed(MOVE_RUN) * float(remaining - MeteorArrivalMarginMs) / 1000.0f;
+        float const distance2d = bot->GetExactDist2d(impact);
+        if (distance2d <= MeteorApproachRadius || distance2d - MeteorApproachRadius > maxWalk)
+            return MeteorResponse::Ignore;
+
+        if (PlayerbotAI::IsHeal(bot))
+        {
+            Spell const* const healing = bot->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+            Player const* const tank = PlayerInRaid(*bot, assignment.targetHolder);
+            if ((healing && healing->GetSpellInfo()->IsPositive()) ||
+                (tank && tank->GetHealthPct() < 70.0f && bot->IsWithinDistInMap(tank, HealerCoverageRange) &&
+                 bot->IsWithinLOSInMap(tank)))
+                return MeteorResponse::Ignore;
+        }
+
+        float const ratio = MeteorApproachRadius / distance2d;
+        float const x = impact.GetPositionX() + ratio * (bot->GetPositionX() - impact.GetPositionX());
+        float const y = impact.GetPositionY() + ratio * (bot->GetPositionY() - impact.GetPositionY());
+        float const impactZ = impact.GetPositionZ();
+        float const z = bot->GetMapHeight(x, y, impactZ + CornerArrival, true, 4.0f);
+        Position const destination(x, y, z);
+        if (destination.GetExactDist(impact) > MeteorHoldRadius || !safeToSoak(destination) ||
+            !hazards.WalkRear(*bot, destination, 0.75f, false, maxWalk))
+            return MeteorResponse::Ignore;
+
+        uint32 const now = getMSTime();
+        if (!lastMeteorMove || now - lastMeteorMove > 2000)
+        {
+            lastMeteorMove = now;
+            LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} {} closes to soak Meteor at {:.1f}yd ({}ms left)",
+                bot->GetInstanceId(), bot->GetName(), distance, remaining);
+        }
+        return MeteorResponse::Move;
+    }
+
     bool BuildFrontWarriorThreat(Creature& target, uint32 openingAt)
     {
         ThreatManager const& threat = target.GetThreatMgr();
@@ -2243,6 +2342,7 @@ private:
     bool holder = false;
     bool fighting = false;
     uint32 legacyRestingMark = 0;
+    uint32 lastMeteorMove = 0;
     uint8 rearSupportMode = 0;
     std::optional<Position> lastRearDestination;
     FourHorsemen40Hazards hazards;

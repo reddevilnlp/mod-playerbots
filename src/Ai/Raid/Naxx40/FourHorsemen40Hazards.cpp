@@ -234,7 +234,8 @@ bool FourHorsemen40Hazards::EscapeVoidZones(Player& bot, Position const& corner,
     return true;
 }
 
-bool FourHorsemen40Hazards::WalkRear(Player& bot, Position const& destination, float arrival, bool detour)
+bool FourHorsemen40Hazards::WalkRear(Player& bot, Position const& destination, float arrival, bool detour,
+    float maxPathLength)
 {
     if (!_ai->CanMove() || !InsideHorsemenRoom(Point(bot)) || !InsideHorsemenRoom(Point(destination)))
         return false;
@@ -247,7 +248,7 @@ bool FourHorsemen40Hazards::WalkRear(Player& bot, Position const& destination, f
         if (destination.GetExactDist(end.x, end.y, end.z) <= arrival)
             return true;
     }
-    else if (bot.isMoving())
+    else if (bot.isMoving() && maxPathLength <= 0.0f)
         bot.StopMoving();
 
     if (bot.GetExactDist(destination) <= arrival || Clearance(destination) < MovementClearance)
@@ -262,11 +263,19 @@ bool FourHorsemen40Hazards::WalkRear(Player& bot, Position const& destination, f
     Movement::PointsArray path;
     if (!GroundLeg(bot, from, to, path))
         return false;
+    if (maxPathLength > 0.0f)
+    {
+        float length = 0.0f;
+        for (std::size_t i = 1; i < path.size(); ++i)
+            length += (path[i] - path[i - 1]).length();
+        if (length > maxPathLength)
+            return false;
+    }
     RaidClear::Leash::WalkCheck const leash(_ai, &bot);
     Position const* const zone = FirstBlockedZone(bot, path);
     if (!zone)
         return !leash.Pulls(path) && Launch(bot, path, _rearSpline);
-    if (!detour)
+    if (!detour || maxPathLength > 0.0f)
         return false;
 
     // The navmesh does not contain spell hazards. Try a dry dogleg around
