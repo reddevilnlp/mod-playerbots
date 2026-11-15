@@ -18,9 +18,11 @@ class Unit;
 inline constexpr char Naxx40MilitaryTrashStrategyName[] = "naxx40 military trash";
 inline constexpr uint32 Naxx40DeathknightCaptain = 351048;
 inline constexpr uint32 Naxx40ShadeOfNaxxramas = 351056;
+inline constexpr uint32 Naxx40NecropolisAcolyte = 351070;
 
 bool IsNaxx40MilitaryTrash(Unit const& unit);
 bool MayPetAttackNaxx40MilitaryTrash(Player const& owner, Unit const& target);
+bool CanEngageNaxx40NecropolisAcolyte(Player const& bot, Unit const& target);
 
 class Naxx40MilitaryActionContext final : public NamedObjectContext<Action>
 {

@@ -6,11 +6,16 @@
 
 #include "MilitaryTrash40.h"
 
+#include "Ai/Raid/RaidClear/Common/Interrupts.h"
 #include "Ai/Raid/RaidClear/Common/KillOrder.h"
 #include "Ai/Raid/RaidClear/Common/WayOut.h"
 #include "CombatManager.h"
+#include "Creature.h"
+#include "Group.h"
 #include "Naxx40Encounter.h"
 #include "ReachTargetActions.h"
+#include "RtiTargetValue.h"
+#include "Spell.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 
@@ -25,6 +30,8 @@ namespace
     constexpr uint32 AxeWhirlwindAura = 24236;
     constexpr uint32 AxeWhirlwindDamage = 15589;
     constexpr uint32 CaptainWhirlwind = 28335;
+    constexpr uint32 ShadowBoltVolley = 28448;
+    constexpr float FloorBand = 5.0f;
 }
 
 bool IsNaxx40MilitaryTrash(Unit const& unit)
@@ -52,13 +59,83 @@ bool MayPetAttackNaxx40MilitaryTrash(Player const& owner, Unit const& target)
     return false;
 }
 
+bool CanEngageNaxx40NecropolisAcolyte(Player const& bot, Unit const& target)
+{
+    Creature const* acolyte = target.ToCreature();
+    return acolyte && acolyte->GetEntry() == Naxx40NecropolisAcolyte && acolyte->IsAlive() &&
+           acolyte->IsInCombat() && !acolyte->IsEvadingAttacks() &&
+           std::abs(bot.GetPositionZ() - acolyte->GetPositionZ()) <= FloorBand && bot.IsWithinLOSInMap(acolyte);
+}
+
 namespace
 {
     constexpr char NearWhirlwind[] = "naxx40 military whirlwind too close";
     constexpr char StayClear[] = "naxx40 military stay clear";
+    constexpr char AcolyteCasting[] = "naxx40 acolyte casting volley";
+    constexpr char InterruptAcolyte[] = "naxx40 interrupt acolyte volley";
     constexpr float WhirlwindSearch = 40.0f;
-    constexpr float FloorBand = 5.0f;
     constexpr float MovementMargin = 1.0f;
+
+    char const* VolleyInterrupt(PlayerbotAI* ai, Player* bot, Unit* target)
+    {
+        if (!target || target->GetEntry() != Naxx40NecropolisAcolyte ||
+            !CanEngageNaxx40NecropolisAcolyte(*bot, *target) || !bot->IsValidAttackTarget(target))
+            return nullptr;
+
+        Spell const* spell = target->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+        SpellInfo const* info = spell ? spell->GetSpellInfo() : nullptr;
+        if (!info || info->Id != ShadowBoltVolley || RaidClear::InterruptJustSent(target))
+            return nullptr;
+
+        return RaidClear::ReadyStop(ai, bot, target, info, false);
+    }
+
+    Unit* AcolyteToInterrupt(PlayerbotAI* ai, Player* bot, char const*& interrupt)
+    {
+        Group* group = bot->GetGroup();
+        if (!group || !bot->IsInCombat() || !IsNaxx40Map(bot->FindMap()))
+            return nullptr;
+
+        Unit* current = ai->GetAiObjectContext()->GetValue<Unit*>("current target")->Get();
+        interrupt = VolleyInterrupt(ai, bot, current);
+        if (interrupt)
+            return current;
+
+        Unit* skull = ai->GetUnit(group->GetTargetIcon(RtiTargetValue::skullIndex));
+        if (skull == current)
+            return nullptr;
+        interrupt = VolleyInterrupt(ai, bot, skull);
+        return interrupt ? skull : nullptr;
+    }
+
+    class AcolyteVolleyTrigger final : public Trigger
+    {
+    public:
+        explicit AcolyteVolleyTrigger(PlayerbotAI* ai) : Trigger(ai, AcolyteCasting) {}
+
+        bool IsActive() override
+        {
+            char const* interrupt = nullptr;
+            return AcolyteToInterrupt(botAI, bot, interrupt) != nullptr;
+        }
+    };
+
+    class InterruptAcolyteVolleyAction final : public Action
+    {
+    public:
+        explicit InterruptAcolyteVolleyAction(PlayerbotAI* ai) : Action(ai, InterruptAcolyte) {}
+
+        bool Execute(Event /*event*/) override
+        {
+            char const* interrupt = nullptr;
+            Unit* acolyte = AcolyteToInterrupt(botAI, bot, interrupt);
+            if (!acolyte || !botAI->CastSpell(interrupt, acolyte))
+                return false;
+
+            RaidClear::InterruptSent(acolyte);
+            return true;
+        }
+    };
 
     struct WhirlwindSource
     {
@@ -210,6 +287,7 @@ namespace
         {
             triggers.push_back(new TriggerNode(NearWhirlwind, {NextAction(StayClear, ACTION_EMERGENCY + 3)}));
             triggers.push_back(new TriggerNode("rc kill order", {NextAction("rc mark kill order", ACTION_RAID + 2)}));
+            triggers.push_back(new TriggerNode(AcolyteCasting, {NextAction(InterruptAcolyte, ACTION_INTERRUPT + 1)}));
         }
 
         void InitMultipliers(std::vector<Multiplier*>& multipliers) override
@@ -222,11 +300,13 @@ namespace
 Naxx40MilitaryActionContext::Naxx40MilitaryActionContext()
 {
     creators[StayClear] = [](PlayerbotAI* ai) { return new StayClearOfWhirlwindAction(ai); };
+    creators[InterruptAcolyte] = [](PlayerbotAI* ai) { return new InterruptAcolyteVolleyAction(ai); };
 }
 
 Naxx40MilitaryTriggerContext::Naxx40MilitaryTriggerContext()
 {
     creators[NearWhirlwind] = [](PlayerbotAI* ai) { return new WhirlwindProximityTrigger(ai); };
+    creators[AcolyteCasting] = [](PlayerbotAI* ai) { return new AcolyteVolleyTrigger(ai); };
 }
 
 Naxx40MilitaryStrategyContext::Naxx40MilitaryStrategyContext()

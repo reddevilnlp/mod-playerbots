@@ -29,7 +29,7 @@ namespace RaidClear
         std::vector<KillOrderEntry> const& KillOrderForBot(Player const& bot)
         {
             static std::vector<KillOrderEntry> const militaryTrash = {
-                {Naxx40ShadeOfNaxxramas, 0}, {Naxx40DeathknightCaptain, 1}};
+                {Naxx40NecropolisAcolyte, 0}, {Naxx40ShadeOfNaxxramas, 1}, {Naxx40DeathknightCaptain, 2}};
             return IsNaxx40Map(bot.FindMap()) ? militaryTrash : RaidClear::KillOrderFor(bot.GetMapId());
         }
 
@@ -61,6 +61,9 @@ namespace RaidClear
 
     bool KillOrderSkips(Player* bot, Unit const* unit)
     {
+        if (unit && unit->GetEntry() == Naxx40NecropolisAcolyte && IsNaxx40Map(bot->FindMap()))
+            return !CanEngageNaxx40NecropolisAcolyte(*bot, *unit);
+
         switch (bot->GetMapId())
         {
             case MoltenCore::MAP_ID:       return MoltenCore::KillOrderSkips(bot, unit);
