@@ -56,6 +56,7 @@ constexpr uint8 NoSupportSlot = 5;
 constexpr uint32 RotationStacks = 2;
 constexpr uint32 SnapshotInterval = 200;
 constexpr uint32 RetryDelay = 5000;
+constexpr uint32 HolderBuffRestoreWait = 8000;
 constexpr uint32 OpeningThreatWindow = 12000;
 constexpr uint32 OpeningRearHealingWindow = 45000;
 constexpr uint32 FrontOpeningThreatWindow = 8000;
@@ -287,6 +288,7 @@ struct HolderBuffChange
     uint32 openingStartedAt;
     uint8 spec;
     ObjectGuid group;
+    std::optional<uint32> restoreStarted;
 };
 
 std::mutex HolderBuffsMutex;
@@ -416,7 +418,7 @@ bool ApplyHolderBuff(PlayerbotAI& ai, uint32 spell, uint32 openingStartedAt = 0)
     {
         std::lock_guard<std::mutex> lock(HolderBuffsMutex);
         HolderBuffChange const saved{previous, spell, tank->GetInstanceId(), openingStartedAt,
-            tank->GetActiveSpec(), group->GetGUID()};
+            tank->GetActiveSpec(), group->GetGUID(), std::nullopt};
         if (HolderBuffs.try_emplace(tank->GetGUID(), saved).second)
             LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} {} saved tank buff change {} -> {} (spec {})",
                 saved.instanceId, tank->GetName(), previous, spell, saved.spec);
@@ -2679,9 +2681,23 @@ bool FourHorsemen40::RestoreHolderBuff(PlayerbotAI& ai)
     if (sameSpec && current != saved.previousSpell && (current == saved.tankSpell || current == 0))
     {
         if (saved.previousSpell && bot->HasSpell(saved.previousSpell))
-            return ai.CastSpell(saved.previousSpell, bot);
-        if (!saved.previousSpell)
+        {
+            uint32 const now = getMSTime();
+            if (!saved.restoreStarted)
+            {
+                std::lock_guard<std::mutex> lock(HolderBuffsMutex);
+                auto const found = HolderBuffs.find(bot->GetGUID());
+                if (found != HolderBuffs.end())
+                    found->second.restoreStarted = now;
+            }
+            if (!saved.restoreStarted || getMSTimeDiff(*saved.restoreStarted, now) < HolderBuffRestoreWait)
+                return ai.CastSpell(saved.previousSpell, bot);
+        }
+        if (current == saved.tankSpell)
             bot->RemoveAurasDueToSpell(saved.tankSpell);
+        if (saved.previousSpell)
+            LOG_WARN("playerbots", "[Naxx40] Horsemen instance={} {} could not restore buff {} (temporary {})",
+                saved.instanceId, bot->GetName(), saved.previousSpell, saved.tankSpell);
     }
 
     {
