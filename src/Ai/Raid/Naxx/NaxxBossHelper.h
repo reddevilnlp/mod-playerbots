@@ -182,6 +182,7 @@ public:
     bool IsPhaseOne() { return _unit && _unit->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE); }
     bool IsPhaseTwo() { return _unit && !_unit->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE); }
     bool IsNaxx40Encounter() const;
+    Unit const* GetBoss() const { return _unit; }
     bool IsNaxx40PhaseOne();
     bool InNaxx40Camp(Unit const* member = nullptr) const;
     bool IsNaxx40Incoming(Unit* target) const;

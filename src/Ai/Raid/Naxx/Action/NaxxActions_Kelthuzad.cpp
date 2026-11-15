@@ -5,6 +5,7 @@
  */
 
 #include "NaxxActions.h"
+#include "Group.h"
 #include "Map.h"
 #include "MotionMaster.h"
 #include "Pet.h"
@@ -12,10 +13,56 @@
 #include "Playerbots.h"
 
 #include <algorithm>
+#include <array>
 
 namespace
 {
 constexpr float SoldierInterceptRadius = 20.0f;
+constexpr uint32 FrostBlastAura = 27808;
+constexpr float FrostBlastHealRange = 35.0f;
+constexpr float FrostBlastHealHealth = 65.0f;
+
+bool HealFrostBlast(PlayerbotAI& ai, Unit const& boss)
+{
+    Player* bot = ai.GetBot();
+    Group* group = bot->GetGroup();
+    if (!group || !PlayerbotAI::IsHeal(bot) || bot->IsNonMeleeSpellCast(true))
+        return false;
+
+    Player* target = nullptr;
+    float lowest = FrostBlastHealHealth;
+    for (GroupReference const* ref = group->GetFirstMember(); ref; ref = ref->next())
+    {
+        Player* member = ref->GetSource();
+        if (!member || !member->IsAlive() || !member->HasAura(FrostBlastAura, boss.GetGUID()) ||
+            member->GetHealthPct() >= FrostBlastHealHealth ||
+            !bot->IsWithinDistInMap(member, FrostBlastHealRange) || !bot->IsWithinLOSInMap(member))
+            continue;
+
+        float const urgency = member->GetHealthPct() - (boss.GetVictim() == member ? 15.0f : 0.0f);
+        if (urgency < lowest)
+        {
+            target = member;
+            lowest = urgency;
+        }
+    }
+    if (!target)
+        return false;
+
+    std::array<char const*, 2> spells;
+    switch (bot->getClass())
+    {
+        case CLASS_DRUID:   spells = {"swiftmend", "regrowth"}; break;
+        case CLASS_PALADIN: spells = {"holy shock", "flash of light"}; break;
+        case CLASS_PRIEST:   spells = {"power word: shield", "flash heal"}; break;
+        case CLASS_SHAMAN:   spells = {"riptide", "lesser healing wave"}; break;
+        default: return false;
+    }
+    for (char const* spell : spells)
+        if (ai.CanCastSpell(spell, target) && ai.CastSpell(spell, target))
+            return true;
+    return false;
+}
 
 int IncomingPriority(Unit const& add, float distance)
 {
@@ -67,6 +114,9 @@ bool KelthuzadChooseTargetAction::Execute(Event /*event*/)
 {
     if (!helper.UpdateBossAI())
         return false;
+
+    if (helper.IsNaxx40Encounter() && helper.IsPhaseTwo() && HealFrostBlast(*botAI, *helper.GetBoss()))
+        return true;
 
     GuidVector attackers = context->GetValue<GuidVector>("attackers")->Get();
     if (helper.IsNaxx40PhaseOne())
