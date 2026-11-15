@@ -7,6 +7,7 @@
 #include "FourHorsemen40.h"
 #include "FourHorsemen40Hazards.h"
 
+#include "AiFactory.h"
 #include "AttackAction.h"
 #include "BossLookup.h"
 #include "DruidShapeshiftActions.h"
@@ -164,8 +165,10 @@ struct OpeningPlan
     ObjectGuid leader;
     std::vector<OpeningMember> members;
     std::array<uint32, CornerCount> suppliesAttempt{};
+    std::array<uint8, CornerCount> suppliesUsed{};
     uint32 suppliesStarted = 0;
     bool suppliesChecked = false;
+    uint32 startedAt = 0;
     uint32 lastDrive = 0;
     uint32 lastReport = 0;
     uint32 pullRequestedAt = 0;
@@ -238,6 +241,16 @@ struct Assignment
 
 std::mutex PlansMutex;
 std::unordered_map<uint32, RaidPlan> Plans;
+
+struct WarriorStanceChange
+{
+    ShapeshiftForm original;
+    uint32 instanceId;
+    uint32 openingStartedAt;
+};
+
+std::mutex WarriorStancesMutex;
+std::unordered_map<ObjectGuid, WarriorStanceChange> WarriorStances;
 
 bool CanAssign(Player* member, Player const& anchor)
 {
@@ -324,6 +337,60 @@ Player* PlayerInRaid(Player& bot, ObjectGuid guid)
 {
     Player* player = guid.IsEmpty() ? nullptr : ObjectAccessor::GetPlayer(bot, guid);
     return CanAssign(player, bot) && player->IsAlive() ? player : nullptr;
+}
+
+bool ApplyHolderBuff(PlayerbotAI& ai, uint32 spell, uint32 openingStartedAt = 0)
+{
+    Player* const tank = ai.GetBot();
+    ShapeshiftForm const original = tank->GetShapeshiftForm();
+    if (!ai.CastSpell(spell, tank))
+        return false;
+
+    if (spell == DefensiveStance && original != FORM_DEFENSIVESTANCE)
+    {
+        std::lock_guard<std::mutex> lock(WarriorStancesMutex);
+        WarriorStances.try_emplace(tank->GetGUID(), WarriorStanceChange{original, tank->GetInstanceId(), openingStartedAt});
+    }
+    return true;
+}
+
+bool PrepareWarriorStances(Player& leader, RaidPlan const& plan, OpeningPlan const& opening)
+{
+    bool ready = true;
+    for (Member const& member : plan.members)
+    {
+        Player* const warrior = PlayerInRaid(leader, member.guid);
+        if (!warrior || warrior->getClass() != CLASS_WARRIOR || warrior->GetGroup() != leader.GetGroup())
+            continue;
+
+        {
+            std::lock_guard<std::mutex> lock(WarriorStancesMutex);
+            auto const previous = WarriorStances.find(member.guid);
+            if (previous != WarriorStances.end() && previous->second.openingStartedAt != opening.startedAt)
+            {
+                ready = false;
+                continue;
+            }
+        }
+
+        // Recover DPS from an older build or a worldserver restart without a stance record.
+        if (warrior->GetShapeshiftForm() != FORM_DEFENSIVESTANCE || IsTank(warrior) ||
+            std::ranges::find(plan.holders, member.guid) != plan.holders.end())
+            continue;
+
+        uint8 const spec = AiFactory::GetPlayerSpecTab(warrior);
+        if (spec != WARRIOR_TAB_ARMS && spec != WARRIOR_TAB_FURY)
+            continue;
+        uint32 const stance = spec == WARRIOR_TAB_FURY && warrior->HasSpell(BerserkerStance) ? BerserkerStance : BattleStance;
+        if (!warrior->HasSpell(stance))
+            continue;
+
+        ready = false;
+        if (!warrior->IsInCombat() && GET_PLAYERBOT_AI(warrior)->CastSpell(stance, warrior))
+            LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} {} returned to DPS stance {} before the pull",
+                leader.GetInstanceId(), warrior->GetName(), stance);
+    }
+    return ready;
 }
 
 void SelectHolders(Player& bot, RaidPlan& plan)
@@ -471,7 +538,7 @@ void StartOpening(Player& leader, RaidPlan& plan, uint32 now)
     StartPlan(leader, plan);
     OpeningPlan& opening = plan.opening.emplace();
     opening.leader = leader.GetGUID();
-    opening.lastDrive = now;
+    opening.startedAt = opening.lastDrive = now;
     for (Member const& member : plan.members)
     {
         if (member.home < 2 || member.home >= CornerCount)
@@ -525,14 +592,21 @@ bool PrepareTankSupplies(Player& leader, RaidPlan const& plan, OpeningPlan& open
             ++ready;
             continue;
         }
-        uint32 const item = !flask && tank->HasItemCount(FlaskItem, 1) ? FlaskItem :
-            !food && !tank->HasAura(EatingAura) && tank->HasItemCount(FoodItem, 1) ? FoodItem : 0;
+        constexpr uint8 FlaskUsed = 1u;
+        constexpr uint8 FoodUsed = 2u;
+        uint8& used = opening.suppliesUsed[corner];
+        bool const canFlask = !flask && !(used & FlaskUsed) && tank->HasItemCount(FlaskItem, 1);
+        bool const canEat = !food && !(used & FoodUsed) && !tank->HasAura(EatingAura) && tank->HasItemCount(FoodItem, 1);
+        uint32 const item = canFlask ? FlaskItem : canEat ? FoodItem : 0;
         pending |= item || (!food && tank->HasAura(EatingAura));
         uint32& last = opening.suppliesAttempt[corner];
         if (item && (!last || now - last >= ItemRetryMs))
         {
             last = now;
+            uint32 const before = tank->GetItemCount(item);
             HorsemenTankConsumable(GET_PLAYERBOT_AI(tank)).Use(item);
+            if (tank->GetItemCount(item) < before)
+                used |= item == FlaskItem ? FlaskUsed : FoodUsed;
         }
     }
 
@@ -697,6 +771,8 @@ FourHorsemen40::Preparation DriveOpening(Player& leader, RaidPlan& plan, Bosses 
 {
     OpeningPlan& opening = *plan.opening;
     opening.lastDrive = now;
+    if (!PrepareWarriorStances(leader, plan, opening))
+        return FourHorsemen40::Preparation::Staging;
     if (!PrepareTankSupplies(leader, plan, opening, now))
         return FourHorsemen40::Preparation::Staging;
     if (std::any_of(bosses.begin(), bosses.end(), [](Creature const* boss) { return !boss || boss->IsInCombat(); }))
@@ -732,7 +808,7 @@ FourHorsemen40::Preparation DriveOpening(Player& leader, RaidPlan& plan, Bosses 
                 {
                     uint32 const form = RequiredHolderBuff(*tank);
                     if (form)
-                        GET_PLAYERBOT_AI(tank)->CastSpell(form, tank);
+                        ApplyHolderBuff(*GET_PLAYERBOT_AI(tank), form, opening.startedAt);
                     tankReady = !RequiredHolderBuff(*tank) && bosses[corner]->GetExactDist(tank) <= OpeningTauntRange &&
                         tank->IsWithinLOSInMap(bosses[corner]);
                 }
@@ -1632,7 +1708,7 @@ public:
             return true;
 
         uint32 const holderBuff = holder && target ? RequiredHolderBuff(*bot) : 0;
-        if (holderBuff && holderBuff != RighteousFury && holderBuff != FrostPresence && botAI->CastSpell(holderBuff, bot))
+        if (holderBuff && holderBuff != RighteousFury && holderBuff != FrostPresence && ApplyHolderBuff(*botAI, holderBuff))
         {
             LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} {} prepares for {} with spell {}",
                 bot->GetInstanceId(), bot->GetName(), Horsemen[corner].name, holderBuff);
@@ -1934,7 +2010,7 @@ bool FourHorsemen40::PullOpening(PlayerbotAI& ai)
     };
     uint32 const form = RequiredHolderBuff(*leader);
     if (form)
-        return ai.CastSpell(form, leader) || wait(*leader, "tank form unavailable");
+        return ApplyHolderBuff(ai, form, opening.startedAt) || wait(*leader, "tank form unavailable");
 
     std::array<OpeningTag, OpeningTankCorners.size()> tags;
     for (std::size_t i = 0; i < tags.size(); ++i)
@@ -1976,6 +2052,100 @@ bool FourHorsemen40::PullOpening(PlayerbotAI& ai)
     if (instance->GetBossState(Encounter) == IN_PROGRESS)
         FinishOpeningTags(*leader, plan, bosses);
     return true;
+}
+
+bool FourHorsemen40::SuppressTankWorldBuff(Player& player, uint32 spellId)
+{
+    using namespace Patchwerk40TankSupplies;
+    if (!IsNaxx40Map(player.FindMap()) || !player.GetGroup() || !CanAssign(&player, player))
+        return false;
+    InstanceScript const* instance = player.GetInstanceScript();
+    if (!instance)
+        return false;
+    EncounterState const state = instance->GetBossState(Encounter);
+    if (state != NOT_STARTED && state != IN_PROGRESS)
+        return false;
+    SpellInfo const* spell = sSpellMgr->GetSpellInfo(spellId);
+    if (!spell || spellId == FlaskAura || spellId == FoodAura)
+        return false;
+    auto conflicts = [spell](uint32 desiredId)
+    {
+        SpellInfo const* desired = sSpellMgr->GetSpellInfo(desiredId);
+        if (!desired)
+            return false;
+        SpellGroupStackRule const rule = sSpellMgr->CheckSpellGroupStackRules(spell, desired);
+        return rule == SPELL_GROUP_STACK_RULE_EXCLUSIVE || rule == SPELL_GROUP_STACK_RULE_EXCLUSIVE_FROM_SAME_CASTER;
+    };
+    if (!conflicts(FlaskAura) && !conflicts(FoodAura))
+        return false;
+
+    std::lock_guard<std::mutex> lock(PlansMutex);
+    auto const found = Plans.find(player.GetInstanceId());
+    if (found == Plans.end() || found->second.group != player.GetGroup()->GetGUID() || !found->second.opening)
+        return false;
+    RaidPlan const& plan = found->second;
+    OpeningPlan const& opening = *plan.opening;
+    if (!opening.suppliesStarted || (state == NOT_STARTED &&
+        (opening.pulled || getMSTimeDiff(opening.lastDrive, getMSTime()) > RetryDelay)))
+        return false;
+    return std::find(plan.holders.begin(), plan.holders.end(), player.GetGUID()) != plan.holders.end();
+}
+
+bool FourHorsemen40::RestoreWarriorStance(PlayerbotAI& ai)
+{
+    Player* const bot = ai.GetBot();
+    if (bot->getClass() != CLASS_WARRIOR || !bot->IsAlive() || bot->IsInCombat())
+        return false;
+
+    WarriorStanceChange saved;
+    {
+        std::lock_guard<std::mutex> lock(WarriorStancesMutex);
+        auto const found = WarriorStances.find(bot->GetGUID());
+        if (found == WarriorStances.end())
+            return false;
+        saved = found->second;
+    }
+
+    if (bot->GetInstanceId() == saved.instanceId && IsNaxx40Map(bot->FindMap()))
+    {
+        InstanceScript const* const instance = bot->GetInstanceScript();
+        EncounterState const state = instance ? instance->GetBossState(Encounter) : TO_BE_DECIDED;
+        if (state == IN_PROGRESS)
+            return false;
+
+        if (state == NOT_STARTED && saved.openingStartedAt)
+        {
+            std::lock_guard<std::mutex> lock(PlansMutex);
+            auto const found = Plans.find(saved.instanceId);
+            if (found != Plans.end() && found->second.opening)
+            {
+                OpeningPlan const& opening = *found->second.opening;
+                if (opening.startedAt == saved.openingStartedAt && !opening.pulled &&
+                    getMSTimeDiff(opening.lastDrive, getMSTime()) < RetryDelay)
+                    return false;
+            }
+        }
+    }
+
+    ShapeshiftForm const current = bot->GetShapeshiftForm();
+    if (current != saved.original && (current == FORM_DEFENSIVESTANCE || current == FORM_NONE))
+    {
+        if (saved.original == FORM_BATTLESTANCE)
+            return ai.CastSpell(BattleStance, bot);
+        if (saved.original == FORM_BERSERKERSTANCE)
+            return ai.CastSpell(BerserkerStance, bot);
+        if (saved.original == FORM_NONE)
+            bot->RemoveAurasDueToSpell(DefensiveStance);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(WarriorStancesMutex);
+        WarriorStances.erase(bot->GetGUID());
+    }
+    if (bot->GetShapeshiftForm() == saved.original)
+        LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} {} restored warrior stance {}",
+            saved.instanceId, bot->GetName(), static_cast<uint32>(saved.original));
+    return false;
 }
 
 FourHorsemen40ActionContext::FourHorsemen40ActionContext()

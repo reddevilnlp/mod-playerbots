@@ -20,6 +20,7 @@
 #include "Engine.h"
 #include "EventProcessor.h"
 #include "ExternalEventHelper.h"
+#include "FourHorsemen40.h"
 #include "GameObjectData.h"
 #include "GameTime.h"
 #include "GridNotifiers.h"
@@ -660,6 +661,12 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
 
             bot->StopMovingOnCurrentPos();
         }
+    }
+
+    if (FourHorsemen40::RestoreWarriorStance(*this))
+    {
+        YieldThread(bot, GetReactDelay());
+        return;
     }
 
     // Update the bot's group status (moved to helper function)

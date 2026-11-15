@@ -12,6 +12,7 @@
 #include "Trigger.h"
 
 class Multiplier;
+class Player;
 class PlayerbotAI;
 
 namespace FourHorsemen40
@@ -26,6 +27,8 @@ namespace FourHorsemen40
     Preparation PrepareOpening(PlayerbotAI& leader);
     Preparation GetOpeningPreparation(PlayerbotAI& member);
     bool PullOpening(PlayerbotAI& leader);
+    bool RestoreWarriorStance(PlayerbotAI& ai);
+    bool SuppressTankWorldBuff(Player& player, uint32 spellId);
 }
 
 class FourHorsemen40ActionContext : public NamedObjectContext<Action>

@@ -5,6 +5,7 @@
  */
 
 #include "WorldBuffAction.h"
+#include "Ai/Raid/Naxx40/FourHorsemen40.h"
 #include "AiFactory.h"
 #include "Event.h"
 #include "Playerbots.h"
@@ -92,7 +93,7 @@ std::vector<uint32> WorldBuffAction::NeedWorldBuffs(Unit* unit)
             continue;
 
         // Final check: does the world-buff spec ID match our effective spec?
-        if (wb.SpecId == effectiveSpec)
+        if (wb.SpecId == effectiveSpec && !FourHorsemen40::SuppressTankWorldBuff(*bot, wb.SpellId))
             retVec.push_back(wb.SpellId);
     }
 
