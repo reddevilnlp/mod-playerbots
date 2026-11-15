@@ -10,6 +10,7 @@
 #include "ItemPackets.h"
 #include "ItemUsageValue.h"
 #include "ItemVisitors.h"
+#include "Naxx40Encounter.h"
 #include "Playerbots.h"
 #include "StatsWeightCalculator.h"
 #include <utility>
@@ -404,6 +405,16 @@ bool EquipUpgradesPacketAction::Execute(Event event)
     }
 
     ItemIds items = SelectInventoryItemsToEquip();
+    if (bot->getClass() == CLASS_WARRIOR && IsNaxx40Map(bot->FindMap()) &&
+        !PlayerbotAI::IsTank(bot) && !PlayerbotAI::IsExplicitMainTank(bot))
+    {
+        // A temporary tank assignment does not turn a DPS warrior's shield into an upgrade.
+        std::erase_if(items, [](uint32 entry)
+        {
+            ItemTemplate const* item = sObjectMgr->GetItemTemplate(entry);
+            return item && item->InventoryType == INVTYPE_SHIELD;
+        });
+    }
     EquipItems(items);
     return true;
 }

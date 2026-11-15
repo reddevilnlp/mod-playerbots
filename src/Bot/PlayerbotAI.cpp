@@ -663,7 +663,7 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
         }
     }
 
-    if (FourHorsemen40::RestoreWarriorStance(*this))
+    if (FourHorsemen40::RestoreHolderBuff(*this))
     {
         YieldThread(bot, GetReactDelay());
         return;

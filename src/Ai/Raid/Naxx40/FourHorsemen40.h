@@ -27,7 +27,7 @@ namespace FourHorsemen40
     Preparation PrepareOpening(PlayerbotAI& leader);
     Preparation GetOpeningPreparation(PlayerbotAI& member);
     bool PullOpening(PlayerbotAI& leader);
-    bool RestoreWarriorStance(PlayerbotAI& ai);
+    bool RestoreHolderBuff(PlayerbotAI& ai);
     bool SuppressTankWorldBuff(Player& player, uint32 spellId);
 }
 
