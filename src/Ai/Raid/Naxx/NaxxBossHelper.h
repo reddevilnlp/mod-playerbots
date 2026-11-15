@@ -181,10 +181,12 @@ public:
     bool UpdateBossAI();
     bool IsPhaseOne() { return _unit && _unit->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE); }
     bool IsPhaseTwo() { return _unit && !_unit->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE); }
+    bool IsNaxx40Encounter() const;
     bool IsNaxx40PhaseOne();
     bool InNaxx40Camp(Unit const* member = nullptr) const;
     bool IsNaxx40Incoming(Unit* target) const;
     static bool IsNaxx40Soldier(Unit const* target);
+    static bool IsNaxx40RangedAdd(Unit const* target);
     Unit* GetAnyShadowFissure()
     {
         Unit* shadow_fissure = nullptr;

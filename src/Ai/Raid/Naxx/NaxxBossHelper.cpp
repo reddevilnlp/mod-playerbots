@@ -24,6 +24,8 @@ namespace
     constexpr uint32 Weaver40Entry = 351075;
     constexpr float KelthuzadCampRadius = 13.0f;
     constexpr float KelthuzadIncomingRadius = 34.0f;
+    constexpr float KelthuzadCleanupRadius = 45.0f;
+    constexpr float KelthuzadTankPickupRange = 18.0f;
 
     // A fight not observed for this long is over (wipe / evade); the next pull starts from scratch.
     constexpr uint32 HeiganStateStaleMs = 30000;
@@ -60,9 +62,14 @@ bool KelthuzadBossHelper::UpdateBossAI()
     return _unit != nullptr;
 }
 
+bool KelthuzadBossHelper::IsNaxx40Encounter() const
+{
+    return _unit && _unit->GetEntry() == Kelthuzad40Entry;
+}
+
 bool KelthuzadBossHelper::IsNaxx40PhaseOne()
 {
-    return IsPhaseOne() && _unit->GetEntry() == Kelthuzad40Entry;
+    return IsNaxx40Encounter() && IsPhaseOne();
 }
 
 bool KelthuzadBossHelper::InNaxx40Camp(Unit const* member) const
@@ -75,6 +82,11 @@ bool KelthuzadBossHelper::IsNaxx40Soldier(Unit const* target)
     return target && target->GetEntry() == Soldier40Entry;
 }
 
+bool KelthuzadBossHelper::IsNaxx40RangedAdd(Unit const* target)
+{
+    return target && (target->GetEntry() == Soldier40Entry || target->GetEntry() == Weaver40Entry);
+}
+
 bool KelthuzadBossHelper::IsNaxx40Incoming(Unit* target) const
 {
     Creature* add = target ? target->ToCreature() : nullptr;
@@ -84,14 +96,19 @@ bool KelthuzadBossHelper::IsNaxx40Incoming(Unit* target) const
 
     if (!_unit || add->GetSummonerGUID() != _unit->GetGUID() || !add->IsInCombat() ||
         !add->GetVictim() || !add->IsAlive() ||
-        add->GetExactDist2d(center.first, center.second) > KelthuzadIncomingRadius ||
         !bot->IsValidAttackTarget(add) || !bot->IsWithinLOSInMap(add))
         return false;
 
-    if (PlayerbotAI::IsRanged(bot) && !PlayerbotAI::IsTank(bot))
+    bool const inWaves = _unit->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE);
+    if (add->GetExactDist2d(center.first, center.second) > (inWaves ? KelthuzadIncomingRadius : KelthuzadCleanupRadius))
+        return false;
+
+    if (PlayerbotAI::IsTank(bot))
+        return !IsNaxx40RangedAdd(add) && bot->IsWithinDistInMap(add, KelthuzadTankPickupRange);
+    if (PlayerbotAI::IsRanged(bot))
         return bot->IsWithinDistInMap(add, sPlayerbotAIConfig.SpellDistance);
 
-    return !IsNaxx40Soldier(add) && bot->IsWithinMeleeRange(add);
+    return !IsNaxx40RangedAdd(add) && bot->IsWithinMeleeRange(add);
 }
 
 bool HeiganBossHelper::UpdateBossAI()

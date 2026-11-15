@@ -202,6 +202,20 @@ float KelthuzadGenericMultiplier::GetValue(Action* action)
     if (!helper.UpdateBossAI())
         return 1.0f;
 
+    if (helper.IsNaxx40Encounter() && helper.IsPhaseTwo())
+    {
+        bool const melee = dynamic_cast<MeleeAction*>(action) || dynamic_cast<CastMeleeSpellAction*>(action);
+        bool const chases = dynamic_cast<ReachMeleeAction*>(action) || dynamic_cast<CastReachTargetSpellAction*>(action)
+            || dynamic_cast<AttackAction*>(action);
+        bool const petAttack = dynamic_cast<PetAttackAction*>(action) != nullptr;
+        if ((melee || chases || petAttack) && !dynamic_cast<KelthuzadChooseTargetAction*>(action))
+        {
+            Unit* target = petAttack ? AI_VALUE(Unit*, "current target") : action->GetTarget();
+            if (helper.IsNaxx40RangedAdd(target))
+                return 0.0f;
+        }
+    }
+
     if (helper.IsNaxx40PhaseOne())
     {
         if (dynamic_cast<KelthuzadPositionAction*>(action) || dynamic_cast<KelthuzadChooseTargetAction*>(action) ||
@@ -233,7 +247,7 @@ float KelthuzadGenericMultiplier::GetValue(Action* action)
             if (!hostileTarget)
                 target = AI_VALUE(Unit*, "current target");
             if (!helper.InNaxx40Camp() || !helper.IsNaxx40Incoming(target) ||
-                (melee && helper.IsNaxx40Soldier(target)))
+                (melee && helper.IsNaxx40RangedAdd(target)))
                 return 0.0f;
         }
     }

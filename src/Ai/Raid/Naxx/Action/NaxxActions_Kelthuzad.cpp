@@ -13,6 +13,56 @@
 
 #include <algorithm>
 
+namespace
+{
+constexpr float SoldierInterceptRadius = 20.0f;
+
+int IncomingPriority(Unit const& add, float distance)
+{
+    if (KelthuzadBossHelper::IsNaxx40Soldier(&add))
+        return distance <= SoldierInterceptRadius ? 0 : 2;
+    if (KelthuzadBossHelper::IsNaxx40RangedAdd(&add))
+        return 1;
+    Unit* victim = add.GetVictim();
+    Player* player = victim ? victim->ToPlayer() : nullptr;
+    return player && PlayerbotAI::IsTank(player) ? 4 : 3;
+}
+
+Unit* SelectIncoming(PlayerbotAI& ai, KelthuzadBossHelper const& helper, GuidVector const& attackers,
+                     bool rangedAddsOnly)
+{
+    Unit* incoming = nullptr;
+    int priority = 0;
+    float distance = 0.0f;
+    for (ObjectGuid const& guid : attackers)
+    {
+        Unit* candidate = ai.GetUnit(guid);
+        if ((rangedAddsOnly && !helper.IsNaxx40RangedAdd(candidate)) || !helper.IsNaxx40Incoming(candidate))
+            continue;
+
+        // A Soldier about to reach the raid still comes first. Otherwise focus the slow
+        // Weaver before it gets a melee swing and cones the camp.
+        float const candidateDistance = candidate->GetExactDist2d(helper.center.first, helper.center.second);
+        int const candidatePriority = IncomingPriority(*candidate, candidateDistance);
+        if (!incoming || candidatePriority < priority || (candidatePriority == priority && candidateDistance < distance))
+        {
+            incoming = candidate;
+            priority = candidatePriority;
+            distance = candidateDistance;
+        }
+    }
+    return incoming;
+}
+
+bool SelectWithoutMelee(Player& bot, AiObjectContext& context, Unit* target)
+{
+    bot.AttackStop();
+    bot.SetSelection(target->GetGUID());
+    context.GetValue<Unit*>("current target")->Set(target);
+    return true;
+}
+}
+
 bool KelthuzadChooseTargetAction::Execute(Event /*event*/)
 {
     if (!helper.UpdateBossAI())
@@ -24,34 +74,25 @@ bool KelthuzadChooseTargetAction::Execute(Event /*event*/)
         if (!helper.InNaxx40Camp() || PlayerbotAI::IsHeal(bot))
             return false;
 
-        Unit* incoming = nullptr;
-        for (ObjectGuid const& guid : attackers)
-        {
-            Unit* candidate = botAI->GetUnit(guid);
-            if (!helper.IsNaxx40Incoming(candidate))
-                continue;
-
-            // Ranged players intercept Soldiers first. Fight from camp while the other adds come to us.
-            bool const soldier = helper.IsNaxx40Soldier(candidate);
-            bool const samePriority = soldier == helper.IsNaxx40Soldier(incoming);
-            if (!incoming || (soldier && !samePriority) ||
-                (samePriority && candidate->GetExactDist2d(helper.center.first, helper.center.second) <
-                                 incoming->GetExactDist2d(helper.center.first, helper.center.second)))
-                incoming = candidate;
-        }
+        Unit* incoming = SelectIncoming(*botAI, helper, attackers, false);
         if (!incoming || AI_VALUE(Unit*, "current target") == incoming)
             return false;
 
-        if (helper.IsNaxx40Soldier(incoming) && bot->IsWithinMeleeRange(incoming))
-        {
-            // AttackAction would start a melee swing on a Soldier that has already reached us.
-            bot->AttackStop();
-            bot->SetSelection(incoming->GetGUID());
-            context->GetValue<Unit*>("current target")->Set(incoming);
-            return true;
-        }
+        if (helper.IsNaxx40RangedAdd(incoming) && (bot->IsWithinMeleeRange(incoming) || PlayerbotAI::IsMelee(bot)))
+            return SelectWithoutMelee(*bot, *context, incoming);
         return Attack(incoming, false);
     }
+
+    bool const cleanup = helper.IsNaxx40Encounter();
+    if (cleanup && PlayerbotAI::IsRanged(bot) && !PlayerbotAI::IsTank(bot) && !PlayerbotAI::IsHeal(bot))
+        if (Unit* incoming = SelectIncoming(*botAI, helper, attackers, true))
+        {
+            if (AI_VALUE(Unit*, "current target") == incoming)
+                return false;
+            if (bot->IsWithinMeleeRange(incoming) || PlayerbotAI::IsMelee(bot))
+                return SelectWithoutMelee(*bot, *context, incoming);
+            return Attack(incoming, false);
+        }
 
     Unit* target = nullptr;
     Unit *target_soldier = nullptr, *target_weaver = nullptr, *target_abomination = nullptr, *target_kelthuzad = nullptr,
@@ -59,7 +100,7 @@ bool KelthuzadChooseTargetAction::Execute(Event /*event*/)
     for (auto i = attackers.begin(); i != attackers.end(); ++i)
     {
         Unit* unit = botAI->GetUnit(*i);
-        if (!unit)
+        if (!unit || (cleanup && helper.IsNaxx40RangedAdd(unit)))
             continue;
 
         if (botAI->EqualLowercaseName(unit->GetName(), "guardian of icecrown"))
@@ -119,7 +160,9 @@ bool KelthuzadChooseTargetAction::Execute(Event /*event*/)
             target_kelthuzad = unit;
     }
     std::vector<Unit*> targets;
-    if (PlayerbotAI::IsRanged(bot))
+    if (cleanup && PlayerbotAI::IsMainTank(bot) && target_kelthuzad)
+        targets = {target_kelthuzad};
+    else if (PlayerbotAI::IsRanged(bot))
     {
         if (botAI->GetRangedDpsIndex(bot) <= 1)
             targets = {target_soldier, target_weaver, target_abomination, target_kelthuzad};
@@ -153,6 +196,13 @@ bool KelthuzadPositionAction::Execute(Event /*event*/)
     if (!helper.UpdateBossAI())
         return false;
 
+    if (helper.IsNaxx40Encounter())
+        if (Pet* pet = bot->GetPet(); pet && helper.IsNaxx40RangedAdd(pet->GetVictim()))
+        {
+            pet->AttackStop();
+            pet->GetMotionMaster()->MoveFollow(bot, PET_FOLLOW_DIST, PET_FOLLOW_ANGLE);
+        }
+
     if (helper.IsNaxx40PhaseOne())
     {
         bool stopped = false;
@@ -175,8 +225,7 @@ bool KelthuzadPositionAction::Execute(Event /*event*/)
             }
         }
         if (Pet* pet = bot->GetPet(); pet && pet->GetVictim() &&
-            (!helper.InNaxx40Camp(pet) || helper.IsNaxx40Soldier(pet->GetVictim()) ||
-             !helper.IsNaxx40Incoming(pet->GetVictim())))
+            (!helper.InNaxx40Camp(pet) || !helper.IsNaxx40Incoming(pet->GetVictim())))
         {
             pet->AttackStop();
             pet->GetMotionMaster()->MoveFollow(bot, PET_FOLLOW_DIST, PET_FOLLOW_ANGLE);
