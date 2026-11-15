@@ -171,7 +171,7 @@ struct Member
     uint8 assignedSlot = NoSupportSlot;
     uint8 clearingMarks = 0;
     uint8 reinforcementHome = NoCorner;
-    ObjectGuid coveringTank;
+    ObjectGuid coveringTank{};
 };
 
 struct Rotation
@@ -407,6 +407,42 @@ void StartPlan(Player& bot, RaidPlan& plan)
             position.GetPositionZ(), cornerSizes[corner], player ? player->GetName() : "none",
             player ? (IsTank(player) ? "tank" : "taunt-capable reserve") : "none");
     }
+}
+
+void JoinLivePlan(Player& bot, RaidPlan& plan)
+{
+    if (std::any_of(plan.members.begin(), plan.members.end(),
+        [&bot](Member const& member) { return member.guid == bot.GetGUID(); }))
+        return;
+
+    std::array<uint32, 2> front{};
+    std::array<std::array<bool, NoSupportSlot>, 2> rear{};
+    for (Member const& member : plan.members)
+    {
+        if (member.home < 2)
+            ++front[member.home];
+        else if (member.home < CornerCount && member.supportSlot < NoSupportSlot)
+            rear[member.home - 2][member.supportSlot] = true;
+    }
+    Member joined{bot.GetGUID(), uint8(front[1] < front[0])};
+    bool const healer = PlayerbotAI::IsHeal(&bot);
+    if (healer || PlayerbotAI::IsRangedDps(&bot))
+    {
+        uint8 const first = healer ? 0 : 2;
+        uint8 const last = healer ? 2 : 4;
+        for (uint8 slot = first; slot < last && joined.home < 2; ++slot)
+            for (uint8 side = 0; side < rear.size(); ++side)
+                if (!rear[side][slot])
+                {
+                    joined.home = 2 + side;
+                    joined.supportSlot = slot;
+                    break;
+                }
+    }
+    plan.members.push_back(joined);
+    plan.sampledAt = 0;
+    LOG_INFO("playerbots", "[Naxx40] Horsemen instance={} {} joined the live plan at {}",
+        bot.GetInstanceId(), bot.GetName(), Horsemen[joined.home].name);
 }
 
 void StartOpening(Player& leader, RaidPlan& plan, uint32 now)
@@ -1278,6 +1314,7 @@ Assignment AssignmentFor(Player& bot, Bosses const& bosses)
         LOG_INFO("playerbots", "[Naxx40] Horsemen opening instance={} entered combat (flank readiness {})",
             bot.GetInstanceId(), plan.opening->readyFlanks);
     }
+    JoinLivePlan(bot, plan);
 
     if (!plan.sampledAt || now - plan.sampledAt >= SnapshotInterval)
     {
