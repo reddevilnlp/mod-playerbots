@@ -5,19 +5,25 @@
  */
 
 #include "NaxxActions.h"
+#include "Creature.h"
 #include "Group.h"
 #include "Map.h"
 #include "MotionMaster.h"
 #include "Pet.h"
 #include "PlayerbotAIConfig.h"
 #include "Playerbots.h"
+#include "SpellMgr.h"
 
 #include <algorithm>
 #include <array>
+#include <list>
+#include <tuple>
 
 namespace
 {
 constexpr float SoldierInterceptRadius = 20.0f;
+constexpr uint32 SoulWeaver40Entry = 351075;
+constexpr float WeaverCleanupSearchRadius = 65.0f;
 constexpr uint32 FrostBlastAura = 27808;
 constexpr float FrostBlastHealRange = 35.0f;
 constexpr float FrostBlastHealHealth = 65.0f;
@@ -75,8 +81,7 @@ int IncomingPriority(Unit const& add, float distance)
     return player && PlayerbotAI::IsTank(player) ? 4 : 3;
 }
 
-Unit* SelectIncoming(PlayerbotAI& ai, KelthuzadBossHelper const& helper, GuidVector const& attackers,
-                     bool rangedAddsOnly)
+Unit* SelectIncoming(PlayerbotAI& ai, KelthuzadBossHelper const& helper, GuidVector const& attackers)
 {
     Unit* incoming = nullptr;
     int priority = 0;
@@ -84,7 +89,7 @@ Unit* SelectIncoming(PlayerbotAI& ai, KelthuzadBossHelper const& helper, GuidVec
     for (ObjectGuid const& guid : attackers)
     {
         Unit* candidate = ai.GetUnit(guid);
-        if ((rangedAddsOnly && !helper.IsNaxx40RangedAdd(candidate)) || !helper.IsNaxx40Incoming(candidate))
+        if (!helper.IsNaxx40Incoming(candidate))
             continue;
 
         // A Soldier about to reach the raid still comes first. Otherwise focus the slow
@@ -99,6 +104,54 @@ Unit* SelectIncoming(PlayerbotAI& ai, KelthuzadBossHelper const& helper, GuidVec
         }
     }
     return incoming;
+}
+
+float WeaverDamageRange(PlayerbotAI& ai)
+{
+    Player* bot = ai.GetBot();
+    char const* spell;
+    switch (bot->getClass())
+    {
+        case CLASS_DRUID: spell = "wrath"; break;
+        case CLASS_HUNTER: spell = "auto shot"; break;
+        case CLASS_MAGE: spell = "frostbolt"; break;
+        case CLASS_PRIEST: spell = "mind blast"; break;
+        case CLASS_SHAMAN: spell = "lightning bolt"; break;
+        case CLASS_WARLOCK: spell = "shadow bolt"; break;
+        default: return ai.GetRange("spell");
+    }
+
+    uint32 const id = ai.GetAiObjectContext()->GetValue<uint32>("spell id", spell)->Get();
+    SpellInfo const* info = sSpellMgr->GetSpellInfo(id);
+    return info ? info->GetMaxRange(false, bot) : ai.GetRange("spell");
+}
+
+Creature* SelectEngagedWeaver(PlayerbotAI& ai, Unit const& boss)
+{
+    Player const* bot = ai.GetBot();
+    std::list<Creature*> weavers;
+    boss.GetCreatureListWithEntryInGrid(weavers, SoulWeaver40Entry, WeaverCleanupSearchRadius);
+    float const range = WeaverDamageRange(ai);
+    Creature* selected = nullptr;
+    std::tuple<bool, float, ObjectGuid> selectedPriority;
+    for (Creature* weaver : weavers)
+    {
+        Unit const* victim = weaver->GetVictim();
+        if (weaver->GetSummonerGUID() != boss.GetGUID() || !weaver->IsAlive() || !weaver->IsInCombat() ||
+            !victim || !victim->IsAlive() || weaver->IsPolymorphed() ||
+            weaver->HasAuraWithMechanic(1ULL << MECHANIC_BANISH) || !bot->IsValidAttackTarget(weaver) ||
+            !bot->IsWithinCombatRange(weaver, range) || !bot->IsWithinLOSInMap(weaver))
+            continue;
+
+        // Focus a Weaver that has reached its target first, then finish the most wounded one.
+        auto const priority = std::tuple(!weaver->IsWithinMeleeRange(victim), weaver->GetHealthPct(), weaver->GetGUID());
+        if (!selected || priority < selectedPriority)
+        {
+            selected = weaver;
+            selectedPriority = priority;
+        }
+    }
+    return selected;
 }
 
 bool SelectWithoutMelee(Player& bot, AiObjectContext& context, Unit* target)
@@ -124,7 +177,7 @@ bool KelthuzadChooseTargetAction::Execute(Event /*event*/)
         if (!helper.InNaxx40Camp() || PlayerbotAI::IsHeal(bot))
             return false;
 
-        Unit* incoming = SelectIncoming(*botAI, helper, attackers, false);
+        Unit* incoming = SelectIncoming(*botAI, helper, attackers);
         if (!incoming || AI_VALUE(Unit*, "current target") == incoming)
             return false;
 
@@ -135,13 +188,13 @@ bool KelthuzadChooseTargetAction::Execute(Event /*event*/)
 
     bool const cleanup = helper.IsNaxx40Encounter();
     if (cleanup && PlayerbotAI::IsRanged(bot) && !PlayerbotAI::IsTank(bot) && !PlayerbotAI::IsHeal(bot))
-        if (Unit* incoming = SelectIncoming(*botAI, helper, attackers, true))
+        if (Creature* weaver = SelectEngagedWeaver(*botAI, *helper.GetBoss()))
         {
-            if (AI_VALUE(Unit*, "current target") == incoming)
+            if (AI_VALUE(Unit*, "current target") == weaver)
                 return false;
-            if (bot->IsWithinMeleeRange(incoming) || PlayerbotAI::IsMelee(bot))
-                return SelectWithoutMelee(*bot, *context, incoming);
-            return Attack(incoming, false);
+            if (bot->IsWithinMeleeRange(weaver))
+                return SelectWithoutMelee(*bot, *context, weaver);
+            return Attack(weaver, false);
         }
 
     Unit* target = nullptr;
@@ -210,7 +263,8 @@ bool KelthuzadChooseTargetAction::Execute(Event /*event*/)
             target_kelthuzad = unit;
     }
     std::vector<Unit*> targets;
-    if (cleanup && PlayerbotAI::IsMainTank(bot) && target_kelthuzad)
+    if (cleanup && target_kelthuzad &&
+        (PlayerbotAI::IsMainTank(bot) || (PlayerbotAI::IsTank(bot) && target_kelthuzad->GetVictim() == bot)))
         targets = {target_kelthuzad};
     else if (PlayerbotAI::IsRanged(bot))
     {
