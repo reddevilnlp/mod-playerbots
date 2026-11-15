@@ -9,6 +9,7 @@
 
 #include "AttackAction.h"
 #include "BossLookup.h"
+#include "DruidShapeshiftActions.h"
 #include "EncounterHelpers.h"
 #include "GenericSpellActions.h"
 #include "Group.h"
@@ -635,6 +636,7 @@ public:
     }
 
     bool HoldingCorner() const { return holder; }
+    bool HoldingRearCorner() const { return holder && corner >= 2 && corner < CornerCount; }
 
 private:
     Position RearDestination(uint8 corner, Creature const* otherMark)
@@ -734,11 +736,16 @@ public:
         if (dynamic_cast<CastHealingSpellAction*>(action))
             return 1.0f;
 
+        auto* tactics = dynamic_cast<FourHorsemen40Action*>(context->GetAction(TacticsAction));
+        if (tactics && tactics->HoldingRearCorner() && bot->getClass() == CLASS_DRUID &&
+            (dynamic_cast<CastCasterFormAction*>(action) || dynamic_cast<CastCancelBearFormAction*>(action) ||
+                dynamic_cast<CastCancelDireBearFormAction*>(action)))
+            return 0.0f;
+
         Unit* target = action->GetTarget();
         auto* cast = dynamic_cast<CastSpellAction*>(action);
         SpellInfo const* spell = cast ?
             sSpellMgr->GetSpellInfo(AI_VALUE2(uint32, "spell id", cast->getSpell())) : nullptr;
-        auto* tactics = dynamic_cast<FourHorsemen40Action*>(context->GetAction(TacticsAction));
         if (tactics && tactics->HoldingCorner() && spell)
         {
             if (spell->Id == BattleStance || spell->Id == BerserkerStance ||
