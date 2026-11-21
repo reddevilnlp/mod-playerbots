@@ -5,6 +5,8 @@
  */
 
 #include "NaxxStrategy.h"
+
+#include "Naxx40Horsemen.h"
 #include "NaxxMultipliers.h"
 
 void RaidNaxxStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
@@ -111,6 +113,8 @@ void RaidNaxxStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
         { NextAction("four horsemen attack in order", ACTION_RAID + 1) }
     ));
 
+    Naxx40Horsemen::InitTriggers(triggers);
+
     // sapphiron
     triggers.push_back(new TriggerNode("sapphiron ground",
         { NextAction("sapphiron ground position", ACTION_RAID + 1) }
@@ -156,6 +160,7 @@ void RaidNaxxStrategy::InitMultipliers(std::vector<Multiplier*>& multipliers)
     multipliers.push_back(new KelthuzadGenericMultiplier(botAI));
     multipliers.push_back(new AnubrekhanGenericMultiplier(botAI));
     multipliers.push_back(new FourHorsemenGenericMultiplier(botAI));
+    multipliers.push_back(new Naxx40Horsemen::HorsemenFormationMultiplier(botAI));
     // multipliers.push_back(new GothikGenericMultiplier(botAI));
     multipliers.push_back(new GluthGenericMultiplier(botAI));
 }

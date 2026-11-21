@@ -8,6 +8,7 @@
 #define PLAYERBOTS_NAXXTRIGGERCONTEXT_H
 
 #include "NamedObjectContext.h"
+#include "Naxx40Horsemen.h"
 #include "NaxxTriggers.h"
 
 class RaidNaxxTriggerContext : public NamedObjectContext<Trigger>
@@ -33,6 +34,16 @@ public:
         creators["four horsemen attractors"] = &RaidNaxxTriggerContext::four_horsemen_attractors;
         creators["four horsemen except attractors"] = &RaidNaxxTriggerContext::four_horsemen_except_attractors;
 
+        using namespace Naxx40Horsemen;
+        creators[Name(Tactic::Assign)] = &MakeHorsemenTrigger<Tactic::Assign>;
+        creators[Name(Tactic::Taunt)] = &MakeHorsemenTrigger<Tactic::Taunt>;
+        creators[Name(Tactic::Corner)] = &MakeHorsemenTrigger<Tactic::Corner>;
+        creators[Name(Tactic::Marks)] = &MakeHorsemenTrigger<Tactic::Marks>;
+        creators[Name(Tactic::Meteor)] = &MakeHorsemenTrigger<Tactic::Meteor>;
+        creators[Name(Tactic::VoidZone)] = &MakeHorsemenTrigger<Tactic::VoidZone>;
+        creators[Name(Tactic::HolyWrath)] = &MakeHorsemenTrigger<Tactic::HolyWrath>;
+        creators[Name(Tactic::Attack)] = &MakeHorsemenTrigger<Tactic::Attack>;
+
         creators["sapphiron ground"] = &RaidNaxxTriggerContext::sapphiron_ground;
         creators["sapphiron flight"] = &RaidNaxxTriggerContext::sapphiron_flight;
 
@@ -52,6 +63,12 @@ public:
     }
 
 private:
+    template <Naxx40Horsemen::Tactic tactic>
+    static Trigger* MakeHorsemenTrigger(PlayerbotAI* botAI)
+    {
+        return new Naxx40Horsemen::HorsemenTrigger<tactic>(botAI);
+    }
+
     static Trigger* mutating_injection_melee(PlayerbotAI* botAI) { return new MutatingInjectionMeleeTrigger(botAI); }
     static Trigger* mutating_injection_ranged(PlayerbotAI* botAI) { return new MutatingInjectionRangedTrigger(botAI); }
     static Trigger* mutating_injection_removed(PlayerbotAI* botAI) { return new MutatingInjectionRemovedTrigger(botAI); }

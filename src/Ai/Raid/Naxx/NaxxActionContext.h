@@ -9,6 +9,7 @@
 
 #include "Action.h"
 #include "NamedObjectContext.h"
+#include "Naxx40Horsemen.h"
 #include "NaxxActions.h"
 
 class RaidNaxxActionContext : public NamedObjectContext<Action>
@@ -35,6 +36,16 @@ public:
         creators["four horsemen attract alternatively"] = &RaidNaxxActionContext::four_horsemen_attract_alternatively;
         creators["four horsemen attack in order"] = &RaidNaxxActionContext::four_horsemen_attack_in_order;
 
+        using namespace Naxx40Horsemen;
+        creators[Name(Tactic::Assign)] = &MakeHorsemenAction<AssignCornersAction>;
+        creators[Name(Tactic::Taunt)] = &MakeHorsemenAction<TauntHorsemanAction>;
+        creators[Name(Tactic::Corner)] = &MakeHorsemenAction<HorsemenMoveAction<Tactic::Corner>>;
+        creators[Name(Tactic::Marks)] = &MakeHorsemenAction<HorsemenMoveAction<Tactic::Marks>>;
+        creators[Name(Tactic::Meteor)] = &MakeHorsemenAction<HorsemenMoveAction<Tactic::Meteor>>;
+        creators[Name(Tactic::VoidZone)] = &MakeHorsemenAction<HorsemenMoveAction<Tactic::VoidZone>>;
+        creators[Name(Tactic::HolyWrath)] = &MakeHorsemenAction<HorsemenMoveAction<Tactic::HolyWrath>>;
+        creators[Name(Tactic::Attack)] = &MakeHorsemenAction<AttackHorsemanAction>;
+
         creators["sapphiron ground position"] = &RaidNaxxActionContext::sapphiron_ground_position;
         creators["sapphiron flight position"] = &RaidNaxxActionContext::sapphiron_flight_position;
 
@@ -55,6 +66,12 @@ public:
     }
 
 private:
+    template <class HorsemenAction>
+    static Action* MakeHorsemenAction(PlayerbotAI* botAI)
+    {
+        return new HorsemenAction(botAI);
+    }
+
     static Action* go_behind_the_boss(PlayerbotAI* botAI) { return new GrobbulusGoBehindAction(botAI); }
     static Action* rotate_grobbulus(PlayerbotAI* botAI) { return new GrobbulusRotateAction(botAI); }
     static Action* grobbulus_move_center(PlayerbotAI* botAI) { return new GrobbulusMoveCenterAction(botAI); }
