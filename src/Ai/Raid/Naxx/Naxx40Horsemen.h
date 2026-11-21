@@ -17,13 +17,16 @@ namespace Naxx40Horsemen
 enum class Tactic
 {
     Assign,
+    Prepare,
+    Restore,
     Taunt,
     Corner,
     Marks,
     Meteor,
     VoidZone,
     HolyWrath,
-    Attack
+    Attack,
+    Pets
 };
 
 char const* Name(Tactic tactic);
@@ -52,6 +55,27 @@ public:
     bool Execute(Event event) override;
 };
 
+class PrepareHorsemanTankAction : public Action
+{
+public:
+    PrepareHorsemanTankAction(PlayerbotAI* botAI) : Action(botAI, Name(Tactic::Prepare)) {}
+    bool Execute(Event event) override;
+};
+
+class RestoreHorsemanTankAction : public Action
+{
+public:
+    RestoreHorsemanTankAction(PlayerbotAI* botAI) : Action(botAI, Name(Tactic::Restore)) {}
+    bool Execute(Event event) override;
+};
+
+class ControlHorsemanPetsAction : public Action
+{
+public:
+    ControlHorsemanPetsAction(PlayerbotAI* botAI) : Action(botAI, Name(Tactic::Pets)) {}
+    bool Execute(Event event) override;
+};
+
 template <Tactic tactic>
 class HorsemenMoveAction : public MovementAction
 {
@@ -59,6 +83,9 @@ public:
     HorsemenMoveAction(PlayerbotAI* botAI) : MovementAction(botAI, Name(tactic)) {}
     bool isUseful() override;
     bool Execute(Event event) override;
+
+private:
+    uint32 _meteorCast = 0;
 };
 
 class AttackHorsemanAction : public AttackAction

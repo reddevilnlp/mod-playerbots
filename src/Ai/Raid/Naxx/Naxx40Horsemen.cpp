@@ -9,21 +9,24 @@
 #include <algorithm>
 #include <limits>
 #include <list>
-#include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
 #include "ChooseTargetActions.h"
 #include "Creature.h"
-#include "DruidShapeshiftActions.h"
 #include "EncounterHelpers.h"
+#include "EncounterTankActions.h"
 #include "FollowActions.h"
 #include "Group.h"
 #include "InstanceScript.h"
 #include "Map.h"
 #include "Naxx40HorsemenGeometry.h"
+#include "PetsAction.h"
+#include "PlayerScript.h"
 #include "Playerbots.h"
 #include "ReachTargetActions.h"
+#include "Spell.h"
 #include "Timer.h"
 
 namespace Naxx40Horsemen
@@ -35,20 +38,22 @@ constexpr auto NAXX40_DIFFICULTY = static_cast<Difficulty>(2);
 constexpr uint32 DATA_HORSEMEN_ENCOUNTER = 12;
 constexpr uint32 REFRESH_INTERVAL = 400;
 constexpr uint32 STALE_PLAN_INTERVAL = 5 * IN_MILLISECONDS;
+constexpr uint32 OPENING_SOAK_TIMEOUT = 18 * IN_MILLISECONDS;
 constexpr uint8 TANK_ROTATION_STACKS = 2;
 constexpr uint8 RAID_ROTATION_STACKS = 3;
+constexpr uint8 DPS_ROTATION_GROUPS = 4;
 constexpr float CORNER_TOLERANCE = 7.0f;
 constexpr float APPROACH_DISTANCE = 5.0f;
+constexpr float HANDOFF_DISTANCE = 12.0f;
+constexpr float HEALER_HANDOFF_RANGE = 38.0f;
 constexpr float METEOR_SOAK_DISTANCE = 5.5f;
+constexpr float OPENING_SOAK_TOLERANCE = 2.5f;
 constexpr float HOLY_WRATH_CLEARANCE = 15.0f;
 constexpr float HOLY_WRATH_ARRIVAL_TOLERANCE = 0.5f;
 constexpr float HAZARD_SEARCH_RANGE = 145.0f;
 constexpr uint32 NPC_VOID_ZONE = 16697;
-constexpr uint32 SPELL_TAUNT = 355;
-constexpr uint32 SPELL_GROWL = 6795;
-constexpr uint32 SPELL_HAND_OF_RECKONING = 62124;
-constexpr uint32 SPELL_DARK_COMMAND = 56222;
-constexpr uint32 SPELL_RIGHTEOUS_FURY = 25780;
+constexpr uint32 SPELL_METEOR = 28884;
+Position const OPENING_SOAK_POSITION(2532.0f, -2993.0f, 241.42f);
 constexpr std::array<Corner, CORNER_COUNT> CORNERS = {Corner::Korthazz, Corner::Mograine, Corner::Blaumeux,
                                                       Corner::Zeliek};
 
@@ -71,10 +76,11 @@ constexpr std::array<Horseman, CORNER_COUNT> HORSEMEN = {{
 constexpr std::size_t Index(Corner corner) { return static_cast<std::size_t>(corner); }
 constexpr uint8 MarkBit(Corner corner) { return static_cast<uint8>(1u << Index(corner)); }
 
-constexpr std::array<char const*, 8> NAMES = {
-    "naxx40 horsemen assign corners",   "naxx40 horsemen taunt",       "naxx40 horsemen hold corner",
-    "naxx40 horsemen reset marks",      "naxx40 horsemen soak meteor", "naxx40 horsemen escape void zone",
-    "naxx40 horsemen spread for wrath", "naxx40 horsemen attack",
+constexpr std::array<char const*, 11> NAMES = {
+    "naxx40 horsemen assign corners", "naxx40 horsemen prepare tank",     "naxx40 horsemen restore tank",
+    "naxx40 horsemen taunt",          "naxx40 horsemen hold corner",      "naxx40 horsemen reset marks",
+    "naxx40 horsemen soak meteor",    "naxx40 horsemen escape void zone", "naxx40 horsemen spread for wrath",
+    "naxx40 horsemen attack",         "naxx40 horsemen control pets",
 };
 
 struct BotPlan
@@ -91,6 +97,7 @@ struct BotPlan
     bool reserved = false;
     bool handoff = false;
     bool inVoidZone = false;
+    bool retainCoverage = false;
 };
 
 using BotPlans = std::unordered_map<ObjectGuid, BotPlan>;
@@ -98,6 +105,11 @@ using BotPlans = std::unordered_map<ObjectGuid, BotPlan>;
 struct RaidPlan : DataMap::Base
 {
     uint32 updated = 0;
+    uint32 started = 0;
+    bool firstMeteorSeen = false;
+    bool openingSoak = true;
+    uint32 meteorCast = 0;
+    std::optional<Position> meteorDestination;
     ObjectGuid group;
     ObjectGuid mainTank;
     BotPlans bots;
@@ -105,6 +117,8 @@ struct RaidPlan : DataMap::Base
     std::vector<Position> voidZones;
     std::array<ObjectGuid, CORNER_COUNT> holders;
     std::array<ObjectGuid, CORNER_COUNT> reliefTanks;
+    std::array<ObjectGuid, CORNER_COUNT> outgoingTanks;
+    std::array<ObjectGuid, CORNER_COUNT> healerHolders;
 };
 
 using LiveHorsemen = std::array<Creature*, CORNER_COUNT>;
@@ -147,6 +161,23 @@ uint8 MarksToClear(Player const* player, Corner assignment, bool rotateEarly)
     return mask;
 }
 
+bool CanEnterCorner(Player const* player, Corner corner, uint8 ownLimit, MarkSources const& sources,
+                    Position const& destination)
+{
+    if (Stacks(player, corner) >= ownLimit)
+        return false;
+
+    constexpr float approachMargin = 4.0f;
+    for (Corner other : CORNERS)
+    {
+        MarkSource const& source = sources[Index(other)];
+        if (other != corner && source.radius && Stacks(player, other) >= TANK_ROTATION_STACKS &&
+            destination.GetExactDist2d(source.position) < source.radius + approachMargin)
+            return false;
+    }
+    return true;
+}
+
 LiveHorsemen ReadHorsemen(Player* player, RaidPlan& plan)
 {
     LiveHorsemen bosses{};
@@ -161,12 +192,16 @@ LiveHorsemen ReadHorsemen(Player* player, RaidPlan& plan)
     {
         Horseman const& horseman = HORSEMEN[Index(corner)];
         Creature* boss = instance->GetCreature(horseman.data);
-        if (boss && boss->IsAlive() && boss->GetEntry() == horseman.entry)
+        if (boss && boss->GetEntry() == horseman.entry)
         {
-            bosses[Index(corner)] = boss;
+            // Use the corpse until its spirit becomes visible in the grid.
             plan.markSources[Index(corner)] = {boss->GetPosition(), MarkRadius(corner)};
-            if (!observer)
-                observer = boss;
+            if (boss->IsAlive())
+            {
+                bosses[Index(corner)] = boss;
+                if (!observer)
+                    observer = boss;
+            }
         }
     }
     if (!observer)
@@ -190,6 +225,38 @@ LiveHorsemen ReadHorsemen(Player* player, RaidPlan& plan)
     }
 
     return bosses;
+}
+
+void ReadMeteor(Creature* korthazz, RaidPlan& plan)
+{
+    std::optional<Position> destination;
+    Spell* meteor = korthazz ? korthazz->FindCurrentSpellBySpellId(SPELL_METEOR) : nullptr;
+    if (meteor)
+    {
+        plan.firstMeteorSeen = true;
+        if (meteor->m_targets.HasDst())
+            destination = *meteor->m_targets.GetDstPos();
+    }
+    if (destination && !plan.meteorDestination)
+        plan.meteorCast = plan.updated;
+    plan.meteorDestination = destination;
+    plan.openingSoak =
+        korthazz && (meteor || !plan.firstMeteorSeen) && GetMSTimeDiffToNow(plan.started) < OPENING_SOAK_TIMEOUT;
+}
+
+void SetMeteorPosition(BotPlan& assignment, Creature* boss, Player* holder, RaidPlan const& plan)
+{
+    assignment.movement = Tactic::Meteor;
+    if (plan.meteorDestination)
+        assignment.destination = *plan.meteorDestination;
+    else if (plan.openingSoak)
+        assignment.destination = OPENING_SOAK_POSITION;
+    else if (holder && boss->GetVictim() == holder)
+    {
+        MarkSource const& zeliek = plan.markSources[Index(Corner::Zeliek)];
+        if (!zeliek.radius || holder->GetExactDist2d(zeliek.position) > 2.0f * HOLY_WRATH_CLEARANCE)
+            assignment.destination = holder->GetPosition();
+    }
 }
 
 void PlanTanks(LiveHorsemen const& bosses, std::vector<Player*> const& tanks, RaidPlan& plan, CornerPlayers& holders)
@@ -222,25 +289,43 @@ void PlanTanks(LiveHorsemen const& bosses, std::vector<Player*> const& tanks, Ra
             continue;
         primary[index] = takeTank(plan.holders[index]);
         relief[index] = takeTank(plan.reliefTanks[index]);
-        if (!primary[index] || (relief[index] && relief[index] == bosses[index]->GetVictim()))
+        if (relief[index] && relief[index] == bosses[index]->GetVictim())
+        {
+            if (primary[index])
+                plan.outgoingTanks[index] = primary[index]->GetGUID();
+            std::swap(primary[index], relief[index]);
+        }
+        else if (!primary[index])
             std::swap(primary[index], relief[index]);
     }
 
-    auto assignSpare = [&](CornerPlayers& seats)
+    auto assignSpare = [&](CornerPlayers& seats, bool frontTanksOnly)
     {
         for (Corner corner : openingOrder)
         {
             std::size_t const index = Index(corner);
             if (!bosses[index] || seats[index] || spare.empty())
                 continue;
-            auto best = std::min_element(spare.begin(), spare.end(), [&](Player* left, Player* right)
-                                         { return Stacks(left, corner) < Stacks(right, corner); });
+            if (frontTanksOnly && corner != Corner::Korthazz && corner != Corner::Mograine)
+                continue;
+            auto score = [&](Player* tank)
+            {
+                return std::tuple{!PlayerbotAI::IsTank(tank),
+                                  corner == Corner::Mograine && tank->GetGUID() != plan.mainTank, Stacks(tank, corner),
+                                  std::numeric_limits<uint32>::max() - tank->GetMaxHealth()};
+            };
+            auto best = std::min_element(spare.begin(), spare.end(),
+                                         [&](Player* left, Player* right) { return score(left) < score(right); });
+            if (frontTanksOnly && !PlayerbotAI::IsTank(*best))
+                continue;
             seats[index] = *best;
             spare.erase(best);
         }
     };
 
-    assignSpare(primary);
+    assignSpare(primary, true);
+    assignSpare(relief, true);
+    assignSpare(primary, false);
     for (Corner corner : openingOrder)
     {
         std::size_t const index = Index(corner);
@@ -253,7 +338,7 @@ void PlanTanks(LiveHorsemen const& bosses, std::vector<Player*> const& tanks, Ra
                                       [&](Player* left, Player* right) { return marks(left) < marks(right); });
         primary[index] = std::exchange(*donor, nullptr);
     }
-    assignSpare(relief);
+    assignSpare(relief, false);
 
     for (Corner corner : openingOrder)
     {
@@ -263,6 +348,7 @@ void PlanTanks(LiveHorsemen const& bosses, std::vector<Player*> const& tanks, Ra
         {
             plan.holders[index].Clear();
             plan.reliefTanks[index].Clear();
+            plan.outgoingTanks[index].Clear();
             continue;
         }
         Player* active = primary[index];
@@ -271,13 +357,40 @@ void PlanTanks(LiveHorsemen const& bosses, std::vector<Player*> const& tanks, Ra
         if (next && (next == victim || (active != victim && next->GetGUID() == plan.holders[index])))
             std::swap(active, next);
 
-        bool const needsRelief = Stacks(active, corner) >= TANK_ROTATION_STACKS;
-        if (needsRelief && next && Stacks(next, corner) >= TANK_ROTATION_STACKS)
+        ObjectGuid& outgoingGuid = plan.outgoingTanks[index];
+        if (outgoingGuid)
         {
-            auto fresh = std::find_if(spare.begin(), spare.end(),
-                                      [&](Player* tank) { return Stacks(tank, corner) < TANK_ROTATION_STACKS; });
+            auto const outgoing =
+                std::find_if(tanks.begin(), tanks.end(), [&](Player* tank) { return tank->GetGUID() == outgoingGuid; });
+            if (outgoing == tanks.end() || !(*outgoing)->IsAlive() || !Stacks(*outgoing, corner))
+                outgoingGuid.Clear();
+            else
+            {
+                BotPlan& waiting = plan.bots.at(outgoingGuid);
+                waiting.reserved = true;
+                waiting.clearMarks |= MarkBit(corner);
+            }
+        }
+
+        uint32 const holderStacks = Stacks(active, corner);
+        bool const needsRelief = holderStacks >= TANK_ROTATION_STACKS;
+        auto canRelieve = [&](Player* tank)
+        {
+            uint32 const stacks = Stacks(tank, corner);
+            return stacks < TANK_ROTATION_STACKS && tank->GetGUID() != outgoingGuid;
+        };
+        if (needsRelief && (!next || !canRelieve(next)))
+        {
+            auto fresh = std::find_if(spare.begin(), spare.end(), canRelieve);
             if (fresh != spare.end())
-                std::swap(next, *fresh);
+            {
+                Player* replacement = *fresh;
+                if (next)
+                    *fresh = next;
+                else
+                    spare.erase(fresh);
+                next = replacement;
+            }
         }
 
         holders[index] = active;
@@ -293,21 +406,29 @@ void PlanTanks(LiveHorsemen const& bosses, std::vector<Player*> const& tanks, Ra
         tankPlan.destination = CornerPosition(corner);
         if (victim != active)
             tankPlan.approach = boss->GetGUID();
+        else if (corner == Corner::Korthazz && (plan.openingSoak || plan.meteorDestination))
+            SetMeteorPosition(tankPlan, boss, active, plan);
 
         if (next)
         {
             BotPlan& nextPlan = plan.bots.at(next->GetGUID());
             nextPlan.reserved = true;
             // The original holder keeps attacking until the relief tank has threat.
-            if (needsRelief && Stacks(next, corner) < TANK_ROTATION_STACKS)
+            uint32 const reliefStacks = Stacks(next, corner);
+            if (holderStacks && canRelieve(next))
             {
-                tankPlan.taunt.Clear();
                 nextPlan.tank = true;
                 nextPlan.handoff = true;
                 nextPlan.corner = corner;
                 nextPlan.movement = Tactic::Corner;
-                nextPlan.taunt = boss->GetGUID();
                 nextPlan.approach = boss->GetGUID();
+                // If both have the first mark, take over before the next pulse disqualifies the relief.
+                if (needsRelief || reliefStacks)
+                {
+                    if (victim == active)
+                        tankPlan.taunt.Clear();
+                    nextPlan.taunt = boss->GetGUID();
+                }
             }
         }
     }
@@ -321,39 +442,17 @@ void PlanSupport(Player* member, Corner corner, Creature* boss, Player* holder, 
     assignment.movement = Tactic::Corner;
 
     if (corner == Corner::Korthazz)
-    {
-        assignment.movement = Tactic::Meteor;
-        Unit* victim = boss->GetVictim();
-        MarkSource const& zeliek = plan.markSources[Index(Corner::Zeliek)];
-        if (victim && victim == holder &&
-            (!zeliek.radius || victim->GetExactDist2d(zeliek.position) > 2.0f * HOLY_WRATH_CLEARANCE))
-            assignment.destination = victim->GetPosition();
-    }
+        SetMeteorPosition(assignment, boss, holder, plan);
     else if (corner == Corner::Zeliek)
         assignment.movement = Tactic::HolyWrath;
     else if (!healer && PlayerbotAI::IsMelee(member))
         assignment.approach = boss->GetGUID();
 
+    Position const& holdPosition =
+        corner == Corner::Korthazz && plan.openingSoak ? OPENING_SOAK_POSITION : CornerPosition(corner);
     if (!healer && holder && holder == boss->GetVictim() &&
-        boss->GetExactDist2d(CornerPosition(corner)) <= CORNER_TOLERANCE + APPROACH_DISTANCE)
+        boss->GetExactDist2d(holdPosition) <= CORNER_TOLERANCE + APPROACH_DISTANCE)
         assignment.attack = boss->GetGUID();
-}
-
-bool CanRelieveTank(Player* player)
-{
-    switch (player->getClass())
-    {
-        case CLASS_WARRIOR:
-            return player->HasSpell(SPELL_TAUNT);
-        case CLASS_DRUID:
-            return PlayerbotAI::IsMelee(player) && player->HasSpell(SPELL_GROWL);
-        case CLASS_PALADIN:
-            return player->HasSpell(SPELL_HAND_OF_RECKONING);
-        case CLASS_DEATH_KNIGHT:
-            return player->HasSpell(SPELL_DARK_COMMAND);
-        default:
-            return false;
-    }
 }
 
 using HealerChoices = std::array<std::vector<Player*>, CORNER_COUNT>;
@@ -389,6 +488,11 @@ bool CoverCorner(std::size_t corner, HealerChoices const& choices, CornerPlayers
     return false;
 }
 
+bool InHealingPosition(Player const* healer, Player const* holder)
+{
+    return healer && holder && healer->GetExactDist(holder) <= HEALER_HANDOFF_RANGE && healer->IsWithinLOSInMap(holder);
+}
+
 void PlanHealers(LiveHorsemen const& bosses, CornerPlayers const& holders, std::vector<Player*> const& healers,
                  BotPlans const& previous, RaidPlan& plan, SupportSlots& slots)
 {
@@ -404,7 +508,7 @@ void PlanHealers(LiveHorsemen const& bosses, CornerPlayers const& holders, std::
 
         auto& eligible = choices[index];
         for (Player* healer : healers)
-            if (!MarksToClear(healer, corner, false))
+            if (CanEnterCorner(healer, corner, RAID_ROTATION_STACKS, plan.markSources, SupportPosition(corner, 0)))
                 eligible.push_back(healer);
 
         auto score = [&](Player* healer)
@@ -416,16 +520,73 @@ void PlanHealers(LiveHorsemen const& bosses, CornerPlayers const& holders, std::
         };
         std::stable_sort(eligible.begin(), eligible.end(),
                          [&](Player* left, Player* right) { return score(left) < score(right); });
-        std::array<bool, CORNER_COUNT> visited{};
-        CoverCorner(index, choices, coverage, visited);
     }
+
+    CornerPlayers incumbents{};
+    for (std::size_t index = 0; index < incumbents.size(); ++index)
+    {
+        if (!bosses[index])
+            continue;
+        auto previousHealer = std::find_if(healers.begin(), healers.end(), [&](Player* healer)
+                                           { return healer->GetGUID() == plan.healerHolders[index]; });
+        if (previousHealer != healers.end() && InHealingPosition(*previousHealer, holders[index]))
+            incumbents[index] = *previousHealer;
+    }
+
+    CornerPlayers guards{};
+    bool addedGuard;
+    // Recheck every corner after a rematch, which can move a previously retained healer.
+    do
+    {
+        coverage = {};
+        for (std::size_t index = 0; index < coverage.size(); ++index)
+        {
+            std::array<bool, CORNER_COUNT> visited{};
+            CoverCorner(index, choices, coverage, visited);
+        }
+
+        addedGuard = false;
+        for (std::size_t index = 0; index < coverage.size(); ++index)
+        {
+            Player* incumbent = incumbents[index];
+            if (!incumbent || guards[index] || incumbent == coverage[index] ||
+                InHealingPosition(coverage[index], holders[index]))
+                continue;
+
+            guards[index] = incumbent;
+            for (auto& eligible : choices)
+                std::erase(eligible, incumbent);
+            addedGuard = true;
+        }
+    } while (addedGuard);
 
     std::size_t assigned = 0;
     for (std::size_t index = 0; index < coverage.size(); ++index)
     {
-        if (coverage[index])
+        Corner const corner = CORNERS[index];
+        Player* incumbent = guards[index];
+        Player* replacement = coverage[index];
+        if (incumbent)
         {
-            PlanSupport(coverage[index], CORNERS[index], bosses[index], holders[index], slots[index]++, true, plan);
+            BotPlan& guarding = plan.bots.at(incumbent->GetGUID());
+            guarding.corner = corner;
+            guarding.movement = Tactic::Corner;
+            guarding.destination = incumbent->GetPosition();
+            guarding.retainCoverage = true;
+            ++slots[index];
+            ++assigned;
+        }
+        else
+            plan.healerHolders[index] = replacement ? replacement->GetGUID() : ObjectGuid::Empty;
+
+        if (replacement)
+        {
+            uint8 slot = slots[index]++;
+            if (incumbent && corner == Corner::Zeliek &&
+                incumbent->GetExactDist2d(SupportPosition(corner, 0)) >
+                    incumbent->GetExactDist2d(SupportPosition(corner, 1)))
+                slot = 0;
+            PlanSupport(replacement, corner, bosses[index], holders[index], slot, true, plan);
             ++assigned;
         }
     }
@@ -436,9 +597,13 @@ void PlanHealers(LiveHorsemen const& bosses, CornerPlayers const& holders, std::
             break;
         std::size_t const index = Index(corner);
         auto const& eligible = choices[index];
-        auto spare = std::find_if(
-            eligible.begin(), eligible.end(), [&](Player* healer)
-            { return plan.bots.at(healer->GetGUID()).corner == Corner::None && !MarksToClear(healer, corner, true); });
+        auto spare = std::find_if(eligible.begin(), eligible.end(),
+                                  [&](Player* healer)
+                                  {
+                                      return plan.bots.at(healer->GetGUID()).corner == Corner::None &&
+                                             CanEnterCorner(healer, corner, TANK_ROTATION_STACKS, plan.markSources,
+                                                            SupportPosition(corner, slots[index]));
+                                  });
         if (spare != eligible.end())
         {
             PlanSupport(*spare, corner, bosses[index], holders[index], slots[index]++, true, plan);
@@ -458,18 +623,23 @@ void RefreshPlan(Player* player)
     {
         plan.holders = {};
         plan.reliefTanks = {};
+        plan.outgoingTanks = {};
+        plan.healerHolders = {};
         plan.mainTank.Clear();
+        plan.started = getMSTime();
+        plan.firstMeteorSeen = false;
+        plan.meteorDestination.reset();
         previous.clear();
     }
     plan.group = group->GetGUID();
     plan.updated = getMSTime();
     LiveHorsemen const bosses = ReadHorsemen(player, plan);
+    ReadMeteor(bosses[Index(Corner::Korthazz)], plan);
 
     std::vector<Player*> tanks;
     std::vector<Player*> reserves;
     std::vector<Player*> healers;
     std::vector<Player*> damage;
-    uint8 slot = 0;
     for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
     {
         Player* member = ref->GetSource();
@@ -480,14 +650,15 @@ void RefreshPlan(Player* player)
         if (tank)
             tanks.push_back(member);
         bool const healer = !tank && PlayerbotAI::IsHeal(member);
-        if (!tank && !healer && CanRelieveTank(member))
+        if (!tank && !healer && PlayerbotAI::IsMelee(member) &&
+            EncounterTankActions::CanTaunt(GET_PLAYERBOT_AI(member)))
             reserves.push_back(member);
         if (!member->IsAlive())
             continue;
 
         BotPlan& assignment = plan.bots[member->GetGUID()];
         assignment.clearMarks = MarksToClear(member, Corner::None, true);
-        assignment.slot = slot++;
+        assignment.slot = static_cast<uint8>(std::hash<ObjectGuid>{}(member->GetGUID()));
         assignment.inVoidZone = IsNearVoidZone(member->GetPosition(), plan.voidZones);
         if (!tank)
         {
@@ -525,12 +696,24 @@ void RefreshPlan(Player* player)
         for (Player* member : damage)
         {
             uint8& supportSlot = supportSlots[index];
-            BotPlan const& assignment = plan.bots.at(member->GetGUID());
-            bool const rotateEarly = assignment.slot % RAID_ROTATION_STACKS == 0;
-            if (assignment.reserved || MarksToClear(member, corner, rotateEarly) ||
+            BotPlan& assignment = plan.bots.at(member->GetGUID());
+            if (assignment.reserved ||
                 (corner == Corner::Zeliek && (supportSlot >= ZELIEK_SUPPORT_SLOTS || PlayerbotAI::IsMelee(member))))
                 continue;
-            PlanSupport(member, corner, bosses[index], holders[index], supportSlot++, false, plan);
+
+            BotPlan const waiting = assignment;
+            PlanSupport(member, corner, bosses[index], holders[index], supportSlot, false, plan);
+            uint8 const cohort = assignment.slot % DPS_ROTATION_GROUPS;
+            uint8 const ownLimit = std::min<uint8>(cohort + 1, RAID_ROTATION_STACKS);
+            Position const& arrival = assignment.approach ? bosses[index]->GetPosition() : assignment.destination;
+            if (CanEnterCorner(member, corner, ownLimit, plan.markSources, arrival))
+                ++supportSlot;
+            else
+            {
+                assignment = waiting;
+                if (Stacks(member, corner) >= ownLimit)
+                    assignment.clearMarks |= MarkBit(corner);
+            }
         }
         break;
     }
@@ -542,23 +725,58 @@ Creature* Resolve(Player* player, ObjectGuid guid)
     return creature && creature->IsAlive() ? creature : nullptr;
 }
 
-std::string_view TauntSpell(Player* player)
+bool ControlsTank(Player* player)
 {
-    switch (player->getClass())
-    {
-        case CLASS_WARRIOR:
-            return "taunt";
-        case CLASS_DRUID:
-            return "growl";
-        case CLASS_PALADIN:
-            return "hand of reckoning";
-        case CLASS_DEATH_KNIGHT:
-            return "dark command";
-        default:
-            return {};
-    }
+    BotPlan const* plan = IsActive(player) ? FindPlan(GetPlan(player), player) : nullptr;
+    return plan && plan->tank;
 }
+
+std::string const RESTORATION_KEY = "playerbots.naxx40.horsemen.restore-scheduled";
+
+struct ScheduledRestoration : DataMap::Base
+{
+};
+
+void ScheduleRestore(Player* player)
+{
+    PlayerbotAI* botAI = GET_PLAYERBOT_AI(player);
+    if (!botAI || IsNaxx40(player) || player->CustomData.Get<ScheduledRestoration>(RESTORATION_KEY) ||
+        !EncounterTankActions::HasTemporaryState(botAI))
+        return;
+
+    player->CustomData.GetDefault<ScheduledRestoration>(RESTORATION_KEY);
+    player->m_Events.AddEventAtOffset(
+        [player]
+        {
+            player->CustomData.Erase(RESTORATION_KEY);
+            PlayerbotAI* currentAI = GET_PLAYERBOT_AI(player);
+            if (!currentAI || !player->IsInWorld() || !player->IsAlive() || IsNaxx40(player))
+                return;
+
+            EncounterTankActions::Restore(currentAI);
+            ScheduleRestore(player);
+        },
+        Seconds(1));
+}
+
+class HorsemenCleanupScript : public PlayerScript
+{
+public:
+    HorsemenCleanupScript()
+        : PlayerScript("HorsemenCleanupScript", {PLAYERHOOK_ON_MAP_CHANGED, PLAYERHOOK_ON_PLAYER_RESURRECT})
+    {
+    }
+
+    void OnPlayerMapChanged(Player* player) override { ScheduleRestore(player); }
+    void OnPlayerResurrect(Player* player, float /*restorePercent*/, bool& /*applySickness*/) override
+    {
+        ScheduleRestore(player);
+    }
+};
+
 }  // namespace
+
+void AddScripts() { new HorsemenCleanupScript(); }
 
 char const* Name(Tactic tactic) { return NAMES[static_cast<std::size_t>(tactic)]; }
 
@@ -574,17 +792,25 @@ void InitTriggers(std::vector<TriggerNode*>& triggers)
     { triggers.push_back(new TriggerNode(Name(tactic), {NextAction(Name(tactic), priority)})); };
     add(Tactic::Assign, ACTION_EMERGENCY + 9);
     add(Tactic::VoidZone, ACTION_EMERGENCY + 8);
+    add(Tactic::Meteor, ACTION_EMERGENCY + 2);
+    add(Tactic::Prepare, ACTION_RAID + 8);
     add(Tactic::Taunt, ACTION_RAID + 7);
     add(Tactic::Marks, ACTION_RAID + 6);
     add(Tactic::HolyWrath, ACTION_RAID + 5);
-    add(Tactic::Meteor, ACTION_RAID + 4);
+    add(Tactic::Restore, ACTION_RAID + 4);
     add(Tactic::Corner, ACTION_RAID + 3);
+    add(Tactic::Pets, ACTION_RAID + 3);
     add(Tactic::Attack, ACTION_RAID + 2);
 }
 
 template <Tactic tactic>
 bool HorsemenTrigger<tactic>::IsActive()
 {
+    if constexpr (tactic == Tactic::Restore)
+        return IsNaxx40(bot) && EncounterTankActions::HasTemporaryState(botAI) && !ControlsTank(bot);
+    if constexpr (tactic == Tactic::Pets)
+        return !bot->m_Controlled.empty() && Naxx40Horsemen::IsActive(bot);
+
     if (!Naxx40Horsemen::IsActive(bot))
         return false;
 
@@ -598,6 +824,8 @@ bool HorsemenTrigger<tactic>::IsActive()
 
     if constexpr (tactic == Tactic::VoidZone)
         return assignment->inVoidZone;
+    if constexpr (tactic == Tactic::Prepare)
+        return assignment->tank && EncounterTankActions::NeedsPreparation(botAI);
     if constexpr (tactic == Tactic::Taunt)
         return !assignment->taunt.IsEmpty();
     if constexpr (tactic == Tactic::Attack)
@@ -623,25 +851,46 @@ bool TauntHorsemanAction::Execute(Event /*event*/)
 
     BotPlan const* plan = FindPlan(GetPlan(bot), bot);
     Creature* target = plan ? Resolve(bot, plan->taunt) : nullptr;
-    std::string const spell(TauntSpell(bot));
-    if (!target || spell.empty())
+    if (!target || (plan->handoff && !bot->IsWithinDistInMap(target, HANDOFF_DISTANCE)))
+        return false;
+    return EncounterTankActions::TryTaunt(botAI, target);
+}
+
+bool PrepareHorsemanTankAction::Execute(Event /*event*/)
+{
+    return ControlsTank(bot) && EncounterTankActions::Prepare(botAI);
+}
+
+bool RestoreHorsemanTankAction::Execute(Event /*event*/)
+{
+    return !ControlsTank(bot) && EncounterTankActions::Restore(botAI);
+}
+
+bool ControlHorsemanPetsAction::Execute(Event /*event*/)
+{
+    if (!IsActive(bot))
         return false;
 
-    if (bot->getClass() == CLASS_DRUID && bot->GetShapeshiftForm() != FORM_BEAR &&
-        bot->GetShapeshiftForm() != FORM_DIREBEAR)
+    BotPlan const* plan = FindPlan(GetPlan(bot), bot);
+    if (!plan)
+        return false;
+
+    Creature* target = Resolve(bot, plan->attack);
+    bool commanded = false;
+    bool needsRecall = false;
+    for (Unit* unit : bot->m_Controlled)
     {
-        if (botAI->CanCastSpell("dire bear form", bot))
-            return botAI->CastSpell("dire bear form", bot);
-        return botAI->CanCastSpell("bear form", bot) && botAI->CastSpell("bear form", bot);
+        Creature* minion = unit->ToCreature();
+        if (!minion || !minion->GetCharmInfo() || !minion->IsAlive())
+            continue;
+        if (target)
+            commanded |= EncounterHelpers::CommandPetAttack(minion, target);
+        else if (minion->GetVictim())
+            needsRecall = true;
     }
-    if (bot->getClass() == CLASS_PALADIN && !bot->HasAura(SPELL_RIGHTEOUS_FURY) &&
-        botAI->CanCastSpell("righteous fury", bot))
-        return botAI->CastSpell("righteous fury", bot);
-
-    if (plan->handoff && !bot->IsWithinMeleeRange(target))
-        return false;
-
-    return target->GetVictim() != bot && botAI->CanCastSpell(spell, target) && botAI->CastSpell(spell, target);
+    if (needsRecall)
+        EncounterHelpers::CallBackPets(bot);
+    return commanded || needsRecall;
 }
 
 template <Tactic tactic>
@@ -672,9 +921,10 @@ bool HorsemenMoveAction<tactic>::Execute(Event /*event*/)
 
     Position destination;
     float tolerance = 2.5f;
-    constexpr MovementPriority priority = (tactic == Tactic::VoidZone || tactic == Tactic::Marks)
-                                              ? MovementPriority::MOVEMENT_FORCED
-                                              : MovementPriority::MOVEMENT_COMBAT;
+    bool const holdingMeteor = tactic == Tactic::Meteor && (raid->openingSoak || raid->meteorDestination);
+    MovementPriority const priority = (holdingMeteor || tactic == Tactic::VoidZone || tactic == Tactic::Marks)
+                                          ? MovementPriority::MOVEMENT_FORCED
+                                          : MovementPriority::MOVEMENT_COMBAT;
     if constexpr (tactic == Tactic::VoidZone)
     {
         if (!IsNearVoidZone(bot->GetPosition(), raid->voidZones))
@@ -688,19 +938,31 @@ bool HorsemenMoveAction<tactic>::Execute(Event /*event*/)
     else
     {
         destination = plan->destination;
-        if constexpr (tactic == Tactic::Marks)
+        if constexpr (tactic == Tactic::Meteor)
         {
-            EncounterHelpers::StopAttackingAndChanneling(bot);
-            if (Pet* pet = bot->GetPet(); pet && pet->IsInCombat())
-                EncounterHelpers::CallBackPets(bot);
+            tolerance = raid->openingSoak && !raid->meteorDestination ? OPENING_SOAK_TOLERANCE : METEOR_SOAK_DISTANCE;
+            if (raid->meteorDestination && raid->meteorCast != _meteorCast)
+            {
+                _meteorCast = raid->meteorCast;
+                context->GetValue<LastMovement&>("last movement")->Get().clear();
+            }
+            if (holdingMeteor && bot->GetExactDist(destination) <= tolerance && bot->isMoving())
+            {
+                bot->StopMoving();
+                context->GetValue<LastMovement&>("last movement")->Get().clear();
+                return true;
+            }
         }
+        if constexpr (tactic == Tactic::Marks)
+            EncounterHelpers::StopAttackingAndChanneling(bot);
         if (IsWaitingForLastMove(priority))
             return false;
 
         if constexpr (tactic == Tactic::Marks)
+        {
             destination = WaitPosition(bot, raid->markSources, raid->voidZones, plan->clearMarks, plan->slot);
-        else if constexpr (tactic == Tactic::Meteor)
-            tolerance = METEOR_SOAK_DISTANCE;
+            tolerance = HOLY_WRATH_ARRIVAL_TOLERANCE;
+        }
         else if constexpr (tactic == Tactic::HolyWrath)
             tolerance = HOLY_WRATH_ARRIVAL_TOLERANCE;
         else if constexpr (tactic == Tactic::Corner)
@@ -713,11 +975,10 @@ bool HorsemenMoveAction<tactic>::Execute(Event /*event*/)
                 if (!approach)
                     return false;
 
-                if (plan->handoff ? bot->IsWithinMeleeRange(approach)
-                                  : bot->GetExactDist2d(approach) <= APPROACH_DISTANCE)
+                if (bot->GetExactDist2d(approach) <= APPROACH_DISTANCE)
                     return false;
                 destination = approach->GetPosition();
-                tolerance = plan->handoff ? HOLY_WRATH_ARRIVAL_TOLERANCE : APPROACH_DISTANCE;
+                tolerance = APPROACH_DISTANCE;
             }
         }
     }
@@ -727,7 +988,7 @@ bool HorsemenMoveAction<tactic>::Execute(Event /*event*/)
 
     if constexpr (tactic == Tactic::VoidZone)
         context->GetValue<LastMovement&>("last movement")->Get().clear();
-    else
+    else if constexpr (tactic != Tactic::Marks)
     {
         std::optional<Position> waypoint = RouteAroundVoidZones(bot, destination, raid->voidZones);
         if (!waypoint)
@@ -758,22 +1019,27 @@ float HorsemenFormationMultiplier::GetValue(Action* action)
     if (!IsActive(bot))
         return 1.0f;
 
-    BotPlan const* plan = FindPlan(GetPlan(bot), bot);
+    RaidPlan const* raid = GetPlan(bot);
+    BotPlan const* plan = FindPlan(raid, bot);
     if (!plan)
         return 1.0f;
 
     if (dynamic_cast<DpsAssistAction*>(action) || dynamic_cast<TankAssistAction*>(action) ||
         dynamic_cast<FollowAction*>(action) || dynamic_cast<CombatFormationMoveAction*>(action) ||
-        dynamic_cast<FleeAction*>(action) || EncounterHelpers::IsTauntAction(bot, action))
+        dynamic_cast<FleeAction*>(action) || dynamic_cast<CastReachTargetSpellAction*>(action) ||
+        dynamic_cast<PetAttackAction*>(action) || dynamic_cast<SetPetStanceAction*>(action))
         return 0.0f;
 
-    if (plan->tank && (dynamic_cast<CastCatFormAction*>(action) || dynamic_cast<CastCasterFormAction*>(action)))
+    if (EncounterTankActions::ConflictsWithTankControl(botAI, action, plan->tank))
         return 0.0f;
 
     if (auto* reach = dynamic_cast<ReachTargetAction*>(action))
     {
+        if (plan->movement == Tactic::Meteor && (raid->openingSoak || raid->meteorDestination))
+            return 0.0f;
+
         Unit* target = reach->GetTarget();
-        if (target && (!bot->IsFriendlyTo(target) || plan->movement == Tactic::HolyWrath ||
+        if (target && (!bot->IsFriendlyTo(target) || plan->retainCoverage || plan->movement == Tactic::HolyWrath ||
                        (plan->movement == Tactic::Marks && plan->clearMarks)))
             return 0.0f;
     }
@@ -794,6 +1060,8 @@ float HorsemenFormationMultiplier::GetValue(Action* action)
 }
 
 template class HorsemenTrigger<Tactic::Assign>;
+template class HorsemenTrigger<Tactic::Prepare>;
+template class HorsemenTrigger<Tactic::Restore>;
 template class HorsemenTrigger<Tactic::Taunt>;
 template class HorsemenTrigger<Tactic::Corner>;
 template class HorsemenTrigger<Tactic::Marks>;
@@ -801,6 +1069,7 @@ template class HorsemenTrigger<Tactic::Meteor>;
 template class HorsemenTrigger<Tactic::VoidZone>;
 template class HorsemenTrigger<Tactic::HolyWrath>;
 template class HorsemenTrigger<Tactic::Attack>;
+template class HorsemenTrigger<Tactic::Pets>;
 
 template class HorsemenMoveAction<Tactic::Corner>;
 template class HorsemenMoveAction<Tactic::Marks>;
@@ -808,3 +1077,5 @@ template class HorsemenMoveAction<Tactic::Meteor>;
 template class HorsemenMoveAction<Tactic::VoidZone>;
 template class HorsemenMoveAction<Tactic::HolyWrath>;
 }  // namespace Naxx40Horsemen
+
+void AddSC_Naxx40HorsemenBotScripts() { Naxx40Horsemen::AddScripts(); }

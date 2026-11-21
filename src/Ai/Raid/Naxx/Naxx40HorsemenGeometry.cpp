@@ -8,9 +8,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <compare>
 #include <limits>
 #include <numbers>
-#include <tuple>
 
 #include "EncounterHelpers.h"
 #include "Map.h"
@@ -30,7 +30,7 @@ std::array<Position, CORNER_COUNT> const cornerPositions = {{
 constexpr std::array<float, CORNER_COUNT> MARK_RADII = {55.0f, 55.0f, 45.0f, 45.0f};
 
 // The platform and the foot of its ramps are reachable by normal movement pathfinding.
-std::array<Position, 9> const waitPositions = {{
+std::array<Position, 11> const waitPositions = {{
     {2528.2f, -2950.3f, 244.87f},
     {2529.5f, -2953.0f, 244.78f},
     {2526.0f, -2947.0f, 245.60f},
@@ -40,6 +40,29 @@ std::array<Position, 9> const waitPositions = {{
     {2537.0f, -2943.0f, 241.57f},
     {2517.0f, -2954.0f, 245.66f},
     {2521.0f, -2947.0f, 245.41f},
+    {2528.0f, -2955.0f, 245.55f},
+    {2536.0f, -2956.0f, 243.12f},
+}};
+
+// Dry positions on both sides of the platform. They cover corners vacated by a moving Horseman.
+std::array<Position, 17> const lateralWaitPositions = {{
+    {2492.5f, -2971.5f, 241.28f},
+    {2495.0f, -2919.0f, 241.28f},
+    {2566.0f, -2990.0f, 241.41f},
+    {2551.0f, -2975.0f, 241.34f},
+    {2575.0f, -2964.0f, 241.32f},
+    {2515.0f, -2904.0f, 241.28f},
+    {2540.0f, -2999.0f, 241.32f},
+    {2480.0f, -2939.0f, 241.28f},
+    {2519.0f, -2995.0f, 241.29f},
+    {2484.0f, -2978.0f, 241.28f},
+    {2561.0f, -2947.0f, 241.28f},
+    {2512.0f, -2977.0f, 241.28f},
+    {2551.0f, -2900.0f, 241.28f},
+    {2483.0f, -2982.0f, 241.43f},
+    {2478.0f, -2977.0f, 241.28f},
+    {2460.0f, -2958.0f, 241.28f},
+    {2607.0f, -2958.0f, 241.39f},
 }};
 
 std::array<std::array<Position, 2>, 3> const supportPositions = {{
@@ -67,7 +90,10 @@ constexpr float VOID_ZONE_ESCAPE_STEP = 7.0f;
 constexpr uint8 VOID_ZONE_ESCAPE_DIRECTIONS = 12;
 constexpr float VOID_ZONE_DETOUR_DISTANCE = 8.0f;
 constexpr float MIN_DETOUR_STEP = 4.0f;
-constexpr float MARK_CLEARANCE = 4.0f;
+constexpr float WITHDRAWAL_DISTANCE = 65.0f;
+constexpr float MARK_RADIUS_MARGIN = 4.0f;
+constexpr uint8 MAX_CENTRAL_ROUTE_CHECKS = 3;
+constexpr uint8 MAX_LATERAL_ROUTE_CHECKS = 4;
 
 bool IsInsideRoom(Position const& position)
 {
@@ -195,23 +221,44 @@ bool BuildRoute(Player* player, PathGenerator& path, Position const& destination
            destination.GetExactDist(x, y, z) <= endpointTolerance;
 }
 
-std::tuple<float, float> MarkClearance(Position const& position, MarkSources const& sources, uint8 marksToClear)
+bool EntersAndStaysInRoom(Movement::PointsArray const& path)
 {
-    // Stop ranking gaps once they are large enough so different slots can use different waiting points.
-    float needed = MARK_CLEARANCE;
-    float all = MARK_CLEARANCE;
+    auto inside = [](auto const& node) { return IsInsideRoom({node.x, node.y, node.z}); };
+    auto const entry = std::find_if(path.begin(), path.end(), inside);
+    return entry != path.end() && std::all_of(entry, path.end(), inside);
+}
+
+struct WithdrawalClearance
+{
+    bool clearsAllAt65;
+    bool clearsPendingMarks;
+    bool clearsEveryMark;
+    float nearestSource;
+
+    auto operator<=>(WithdrawalClearance const&) const = default;
+};
+
+WithdrawalClearance GetWithdrawalClearance(Position const& position, MarkSources const& sources, uint8 marksToClear)
+{
+    float nearest = WITHDRAWAL_DISTANCE;
+    bool clearsPendingMarks = true;
+    bool clearsEveryMark = true;
     for (std::size_t index = 0; index < sources.size(); ++index)
     {
         auto const& source = sources[index];
         if (source.radius <= 0.0f)
             continue;
-        float const clearance = position.GetExactDist2d(source.position) - source.radius;
-        if (marksToClear & (1u << index))
-            needed = std::min(needed, clearance);
-        all = std::min(all, clearance);
+        float const distance = position.GetExactDist2d(source.position);
+        nearest = std::min(nearest, distance);
+        if (distance < source.radius + MARK_RADIUS_MARGIN)
+        {
+            clearsEveryMark = false;
+            if (marksToClear & (1u << index))
+                clearsPendingMarks = false;
+        }
     }
 
-    return {needed, all};
+    return {nearest >= WITHDRAWAL_DISTANCE, clearsPendingMarks, clearsEveryMark, nearest};
 }
 }  // namespace
 
@@ -232,31 +279,95 @@ Position WaitPosition(Player* player, MarkSources const& sources, std::vector<Po
 {
     constexpr float heightTolerance = 1.5f;
     Position const current = player->GetPosition();
-    Position best = current;
-    std::tuple<float, float> bestClearance = {std::numeric_limits<float>::lowest(),
-                                              std::numeric_limits<float>::lowest()};
-    // If displacement made the centre unsafe, do not move from somewhere that already clears the marks.
-    if (IsInsideRoom(current) && !IsNearVoidZone(current, voidZones))
-        bestClearance = MarkClearance(current, sources, marksToClear);
+    WithdrawalClearance const currentClearance = GetWithdrawalClearance(current, sources, marksToClear);
+    if (currentClearance.clearsAllAt65 || IsNearVoidZone(current, voidZones))
+        return current;
 
-    for (std::size_t index = 0; index < waitPositions.size(); ++index)
+    struct Candidate
     {
-        Position candidate = waitPositions[(slot + index) % waitPositions.size()];
-        auto const clearance = MarkClearance(candidate, sources, marksToClear);
+        Position const* position;
+        WithdrawalClearance clearance;
+        float distanceSquared;
+        bool lateral;
+    };
+
+    // A spread-out room can leave no 65-yard point. Rank fallback points by mark coverage and clearance;
+    // reaching one does not mean the bot is outside every mark or can end its withdrawal.
+    std::array<Candidate, waitPositions.size() + lateralWaitPositions.size() + CORNER_COUNT> candidates;
+    auto end = candidates.begin();
+    auto addCandidates = [&](auto const& points, bool lateral)
+    {
+        for (std::size_t index = 0; index < points.size(); ++index)
+        {
+            Position const& point = points[(index + slot) % points.size()];
+            WithdrawalClearance const clearance = GetWithdrawalClearance(point, sources, marksToClear);
+            if (clearance > currentClearance && !IsNearVoidZone(point, voidZones))
+                *end++ = {&point, clearance, current.GetExactDist2dSq(point), lateral};
+        }
+    };
+    addCandidates(waitPositions, false);
+    addCandidates(lateralWaitPositions, true);
+    addCandidates(cornerPositions, true);
+    std::sort(candidates.begin(), end,
+              [](Candidate const& left, Candidate const& right)
+              {
+                  return left.clearance == right.clearance ? left.distanceSquared < right.distanceSquared
+                                                           : left.clearance > right.clearance;
+              });
+
+    std::optional<Position> blocked;
+    WithdrawalClearance blockedClearance = currentClearance;
+    Position best = current;
+    WithdrawalClearance bestClearance = currentClearance;
+    uint8 centralChecks = 0;
+    uint8 lateralChecks = 0;
+    for (auto candidate = candidates.begin(); candidate != end; ++candidate)
+    {
+        // Several central positions share the same ramp. Reserve path checks for both sides of the room.
+        uint8& checks = candidate->lateral ? lateralChecks : centralChecks;
+        uint8 const limit = candidate->lateral ? MAX_LATERAL_ROUTE_CHECKS : MAX_CENTRAL_ROUTE_CHECKS;
+        if (checks >= limit)
+            continue;
+        ++checks;
+
+        Position point = *candidate->position;
+        float const x = point.GetPositionX();
+        float const y = point.GetPositionY();
+        float const z = point.GetPositionZ();
+        float const ground = player->GetMapHeight(x, y, z + heightTolerance, true, heightTolerance * 2.0f);
+        point.Relocate(x, y, ground);
+        if (std::abs(ground - z) > heightTolerance || !IsInsideRoom(point) || IsNearVoidZone(point, voidZones))
+            continue;
+
+        PathGenerator path(player);
+        if (!BuildRoute(player, path, point) || !EntersAndStaysInRoom(path.GetPath()))
+            continue;
+        auto const& endpoint = path.GetPath().back();
+        if (point.GetExactDist(endpoint.x, endpoint.y, endpoint.z) > heightTolerance)
+            continue;
+        WithdrawalClearance const clearance =
+            GetWithdrawalClearance({endpoint.x, endpoint.y, endpoint.z}, sources, marksToClear);
         if (clearance <= bestClearance)
             continue;
-
-        float const x = candidate.GetPositionX();
-        float const y = candidate.GetPositionY();
-        float const z = candidate.GetPositionZ();
-        float const ground = player->GetMapHeight(x, y, z + heightTolerance, true, heightTolerance * 2.0f);
-        candidate.Relocate(x, y, ground);
-        if (std::abs(ground - z) > heightTolerance || !IsInsideRoom(candidate) || IsNearVoidZone(candidate, voidZones))
+        if (FindRouteBlock(current, path.GetPath(), voidZones))
+        {
+            if (clearance > blockedClearance)
+            {
+                blocked = point;
+                blockedClearance = clearance;
+            }
             continue;
+        }
 
-        best = candidate;
+        best = point;
         bestClearance = clearance;
+        if (clearance >= candidate->clearance)
+            break;
     }
+
+    if (blocked && blockedClearance > bestClearance)
+        if (auto waypoint = RouteAroundVoidZones(player, *blocked, voidZones))
+            return *waypoint;
 
     return best;
 }
@@ -335,8 +446,7 @@ std::optional<Position> RouteAroundVoidZones(Player* player, Position const& des
         PathGenerator path(player);
         if (!BuildRoute(player, path, point) || FindRouteBlock(current, path.GetPath(), voidZones))
             return false;
-        return std::all_of(path.GetPath().begin(), path.GetPath().end(),
-                           [](auto const& node) { return IsInsideRoom({node.x, node.y, node.z}); });
+        return EntersAndStaysInRoom(path.GetPath());
     };
 
     if (current.GetExactDist2d(block->from) >= 2.0f * VOID_ZONE_DETOUR_DISTANCE && canReach(block->from))

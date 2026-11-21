@@ -36,6 +36,8 @@ public:
 
         using namespace Naxx40Horsemen;
         creators[Name(Tactic::Assign)] = &MakeHorsemenTrigger<Tactic::Assign>;
+        creators[Name(Tactic::Prepare)] = &MakeHorsemenTrigger<Tactic::Prepare>;
+        creators[Name(Tactic::Restore)] = &MakeHorsemenTrigger<Tactic::Restore>;
         creators[Name(Tactic::Taunt)] = &MakeHorsemenTrigger<Tactic::Taunt>;
         creators[Name(Tactic::Corner)] = &MakeHorsemenTrigger<Tactic::Corner>;
         creators[Name(Tactic::Marks)] = &MakeHorsemenTrigger<Tactic::Marks>;
@@ -43,6 +45,7 @@ public:
         creators[Name(Tactic::VoidZone)] = &MakeHorsemenTrigger<Tactic::VoidZone>;
         creators[Name(Tactic::HolyWrath)] = &MakeHorsemenTrigger<Tactic::HolyWrath>;
         creators[Name(Tactic::Attack)] = &MakeHorsemenTrigger<Tactic::Attack>;
+        creators[Name(Tactic::Pets)] = &MakeHorsemenTrigger<Tactic::Pets>;
 
         creators["sapphiron ground"] = &RaidNaxxTriggerContext::sapphiron_ground;
         creators["sapphiron flight"] = &RaidNaxxTriggerContext::sapphiron_flight;

@@ -38,6 +38,8 @@ public:
 
         using namespace Naxx40Horsemen;
         creators[Name(Tactic::Assign)] = &MakeHorsemenAction<AssignCornersAction>;
+        creators[Name(Tactic::Prepare)] = &MakeHorsemenAction<PrepareHorsemanTankAction>;
+        creators[Name(Tactic::Restore)] = &MakeHorsemenAction<RestoreHorsemanTankAction>;
         creators[Name(Tactic::Taunt)] = &MakeHorsemenAction<TauntHorsemanAction>;
         creators[Name(Tactic::Corner)] = &MakeHorsemenAction<HorsemenMoveAction<Tactic::Corner>>;
         creators[Name(Tactic::Marks)] = &MakeHorsemenAction<HorsemenMoveAction<Tactic::Marks>>;
@@ -45,6 +47,7 @@ public:
         creators[Name(Tactic::VoidZone)] = &MakeHorsemenAction<HorsemenMoveAction<Tactic::VoidZone>>;
         creators[Name(Tactic::HolyWrath)] = &MakeHorsemenAction<HorsemenMoveAction<Tactic::HolyWrath>>;
         creators[Name(Tactic::Attack)] = &MakeHorsemenAction<AttackHorsemanAction>;
+        creators[Name(Tactic::Pets)] = &MakeHorsemenAction<ControlHorsemanPetsAction>;
 
         creators["sapphiron ground position"] = &RaidNaxxActionContext::sapphiron_ground_position;
         creators["sapphiron flight position"] = &RaidNaxxActionContext::sapphiron_flight_position;
