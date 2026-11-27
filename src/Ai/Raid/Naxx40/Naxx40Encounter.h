@@ -25,5 +25,7 @@ inline bool IsNaxx40Map(Map const* map)
 }
 
 std::optional<Position> GetNaxx40Landing(Player const& anchor, Player const& traveler, float x, float y);
+std::optional<Position> GetNaxx40Landing(Player const& anchor, Player const& traveler, Position const& origin,
+                                        float x, float y);
 
 #endif

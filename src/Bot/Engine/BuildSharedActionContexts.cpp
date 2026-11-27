@@ -23,6 +23,7 @@
 #include "MagActionContext.h"
 #include "Naxx40Slime.h"
 #include "MilitaryTrash40.h"
+#include "SpiderTrash40.h"
 #include "NaxxActionContext.h"
 #include "OSActionContext.h"
 #include "OnyActionContext.h"
@@ -62,6 +63,7 @@ void AiObjectContext::BuildSharedActionContexts(
     actionContexts.Add(new RaidNaxxActionContext());
     actionContexts.Add(new Naxx40SlimeActionContext());
     actionContexts.Add(new Naxx40MilitaryActionContext());
+    actionContexts.Add(new Naxx40SpiderActionContext());
     actionContexts.Add(new Patchwerk40ActionContext());
     actionContexts.Add(new FourHorsemen40ActionContext());
     actionContexts.Add(new Gluth40ActionContext());

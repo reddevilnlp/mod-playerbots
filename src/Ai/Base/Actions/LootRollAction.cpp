@@ -5,6 +5,7 @@
  */
 
 #include "LootRollAction.h"
+
 #include "Event.h"
 #include "Group.h"
 #include "ItemUsageValue.h"
@@ -12,6 +13,37 @@
 #include "ObjectMgr.h"
 #include "PlayerbotAIConfig.h"
 #include "Playerbots.h"
+#include "QuestDef.h"
+
+namespace
+{
+constexpr uint32 ITEM_SPLINTER_OF_ATIESH = 22726;
+constexpr uint32 ITEM_FRAME_OF_ATIESH = 22727;
+constexpr uint32 QUEST_FRAME_OF_ATIESH = 9250;
+constexpr uint32 ATIESH_SPLINTERS_REQUIRED = 40;
+constexpr uint32 ITEM_WARTORN_LEATHER_SCRAP = 22373;
+constexpr uint32 ITEM_WARTORN_CHAIN_SCRAP = 22374;
+constexpr uint32 ITEM_WARTORN_PLATE_SCRAP = 22375;
+constexpr uint32 ITEM_WARTORN_CLOTH_SCRAP = 22376;
+
+constexpr uint32 GetWartornScrapClassMask(uint32 itemId)
+{
+    // The scraps are tradeable. Their class restrictions come from the Tier 3 exchanges.
+    switch (itemId)
+    {
+        case ITEM_WARTORN_LEATHER_SCRAP:
+            return (1u << (CLASS_ROGUE - 1)) | (1u << (CLASS_DRUID - 1));
+        case ITEM_WARTORN_CHAIN_SCRAP:
+            return (1u << (CLASS_HUNTER - 1)) | (1u << (CLASS_SHAMAN - 1));
+        case ITEM_WARTORN_PLATE_SCRAP:
+            return (1u << (CLASS_WARRIOR - 1)) | (1u << (CLASS_PALADIN - 1));
+        case ITEM_WARTORN_CLOTH_SCRAP:
+            return (1u << (CLASS_PRIEST - 1)) | (1u << (CLASS_MAGE - 1)) | (1u << (CLASS_WARLOCK - 1));
+        default:
+            return 0;
+    }
+}
+}  // namespace
 
 bool LootRollAction::Execute(Event /*event*/)
 {
@@ -48,8 +80,27 @@ bool LootRollAction::Execute(Event /*event*/)
 
         ItemUsage usage = AI_VALUE2(ItemUsage, "item usage", itemUsageParam);
 
-        // Armor Tokens are classed as MISC JUNK (Class 15, Subclass 0), luckily no other items I found have class bits and epic quality.
-        if (proto->Class == ITEM_CLASS_MISC && proto->SubClass == ITEM_SUBCLASS_JUNK && proto->Quality == ITEM_QUALITY_EPIC)
+        if (itemId == ITEM_SPLINTER_OF_ATIESH)
+        {
+            ItemPosCountVec dest;
+            bool const canCollect =
+                CanBotUseToken(proto, bot) &&
+                !bot->HasItemCount(ITEM_SPLINTER_OF_ATIESH, ATIESH_SPLINTERS_REQUIRED, true) &&
+                !bot->HasItemCount(ITEM_FRAME_OF_ATIESH, 1, true) &&
+                bot->GetQuestStatus(QUEST_FRAME_OF_ATIESH) == QUEST_STATUS_NONE &&
+                bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, roll->itemCount) == EQUIP_ERR_OK;
+            vote = canCollect ? NEED : PASS;
+        }
+        else if (uint32 const scrapClassMask = GetWartornScrapClassMask(itemId))
+        {
+            ItemPosCountVec dest;
+            if ((bot->getClassMask() & scrapClassMask) != 0 &&
+                bot->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, roll->itemCount) == EQUIP_ERR_OK)
+                vote = NEED;
+        }
+        // Tier armor tokens are epic miscellaneous junk.
+        else if (proto->Class == ITEM_CLASS_MISC && proto->SubClass == ITEM_SUBCLASS_JUNK &&
+                 proto->Quality == ITEM_QUALITY_EPIC)
         {
             if (CanBotUseToken(proto, bot))
                 vote = NEED; // Eligible for "Need"
@@ -168,6 +219,10 @@ bool MasterLootRollAction::Execute(Event event)
     p >> randomPropertyId;  // item random property ID
     p >> count;             // items in stack
     p >> timeout;           // the countdown time to choose "need" or "greed"
+
+    // The periodic roll applies class eligibility and the Need/Greed policy to Naxxramas materials.
+    if (itemId == ITEM_SPLINTER_OF_ATIESH || GetWartornScrapClassMask(itemId) != 0)
+        return false;
 
     ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
     if (!proto)

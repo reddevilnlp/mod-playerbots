@@ -14,6 +14,12 @@
 
 std::optional<Position> GetNaxx40Landing(Player const& anchor, Player const& traveler, float x, float y)
 {
+    return GetNaxx40Landing(anchor, traveler, anchor.GetPosition(), x, y);
+}
+
+std::optional<Position> GetNaxx40Landing(Player const& anchor, Player const& traveler, Position const& origin,
+                                        float x, float y)
+{
     Map* const map = anchor.FindMap();
     if (!IsNaxx40Map(map) || !anchor.IsInWorld() || anchor.IsBeingTeleported() || anchor.IsFalling() ||
         anchor.IsFlying() || anchor.GetTransport() || anchor.GetVehicle())
@@ -36,12 +42,12 @@ std::optional<Position> GetNaxx40Landing(Player const& anchor, Player const& tra
         return terrain.floorZ;
     };
 
-    auto const anchorFloor = floorAt(anchor.GetPositionX(), anchor.GetPositionY(), anchor.GetPositionZ());
+    auto const anchorFloor = floorAt(origin.GetPositionX(), origin.GetPositionY(), origin.GetPositionZ());
     if (!anchorFloor)
         return std::nullopt;
 
     auto const landingFloor = floorAt(x, y, *anchorFloor);
-    if (!landingFloor || !map->isInLineOfSight(anchor.GetPositionX(), anchor.GetPositionY(), *anchorFloor + LosHeight,
+    if (!landingFloor || !map->isInLineOfSight(origin.GetPositionX(), origin.GetPositionY(), *anchorFloor + LosHeight,
                                              x, y, *landingFloor + LosHeight, phase, LINEOFSIGHT_ALL_CHECKS,
                                              VMAP::ModelIgnoreFlags::Nothing))
         return std::nullopt;

@@ -9,6 +9,7 @@
 #include "RaidClearConfig.h"
 #include "Ai/Raid/Naxx40/MilitaryTrash40.h"
 #include "Ai/Raid/Naxx40/Naxx40Encounter.h"
+#include "Ai/Raid/Naxx40/SpiderTrash40.h"
 #include "Raids/AhnQiraj/AqRaidClear.h"
 #include "Raids/BlackwingLair/BwlRaidClear.h"
 #include "Raids/MoltenCore/McRaidClear.h"
@@ -33,7 +34,7 @@ namespace RaidClear
             return IsNaxx40Map(bot.FindMap()) ? militaryTrash : RaidClear::KillOrderFor(bot.GetMapId());
         }
 
-        uint8 RankOf(Unit const* unit, std::vector<KillOrderEntry> const& table)
+        uint8 RankOf(Player const& marker, Unit const* unit, std::vector<KillOrderEntry> const& table)
         {
             if (!unit)
                 return RANK_NONE;
@@ -41,6 +42,8 @@ namespace RaidClear
                 if (e.entry == unit->GetEntry())
                     return unit->GetMapId() == TempleOfAhnQiraj::MAP_ID ? TempleOfAhnQiraj::KillOrderRank(unit, e.rank)
                                                                         : e.rank;
+            if (IsNaxx40Map(marker.FindMap()))
+                return Naxx40SpiderTrashRank(marker, *unit).value_or(RANK_NONE);
             return RANK_NONE;
         }
     }
@@ -125,7 +128,7 @@ namespace RaidClear
             if (!unit || !unit->IsAlive() || !unit->IsInCombat() || !bot->IsValidAttackTarget(unit))
                 continue;
 
-            uint8 const rank = RankOf(unit, table);
+            uint8 const rank = RankOf(*bot, unit, table);
             if (rank == RANK_NONE || KillOrderSkips(bot, unit))
                 continue;
 
@@ -146,7 +149,7 @@ namespace RaidClear
             return nullptr;
         }
 
-        if (skull && skull->IsAlive() && skull->IsInCombat() && !skullSkipped && RankOf(skull, table) <= bestRank)
+        if (skull && skull->IsAlive() && skull->IsInCombat() && !skullSkipped && RankOf(*bot, skull, table) <= bestRank)
             return nullptr;  // already on something at least as important
 
         return best;

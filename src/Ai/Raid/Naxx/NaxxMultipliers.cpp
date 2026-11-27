@@ -21,12 +21,14 @@
 #include "PaladinActions.h"
 #include "PetsAction.h"
 #include "PriestActions.h"
+#include "PvpValues.h"
 #include "ReachTargetActions.h"
 #include "RogueActions.h"
 #include "ScriptedCreature.h"
 #include "ShamanActions.h"
 #include "Spell.h"
 #include "SpellMgr.h"
+#include "TemporarySummon.h"
 #include "UseMeetingStoneAction.h"
 #include "WarriorActions.h"
 #include "WipeAction.h"
@@ -314,6 +316,21 @@ float AnubrekhanGenericMultiplier::GetValue(Action* action)
             (dynamic_cast<MovementAction*>(action) || dynamic_cast<CastReachTargetSpellAction*>(action) ||
              dynamic_cast<CastMeleeSpellAction*>(action)))
             return 0.0f;
+
+        if (dynamic_cast<DpsAssistAction*>(action) && IsNaxx40Map(bot->FindMap()))
+        {
+            constexpr uint32 CryptGuard40Entry = 351082;
+            Unit const* target = AI_VALUE(Unit*, "current target");
+            if (IsUnavailableCombatTarget(bot, target))
+                return 1.0f;
+
+            TempSummon const* summon = target->ToTempSummon();
+            bool const isGuard = summon && summon->GetEntry() == CryptGuard40Entry && summon->IsInCombat() &&
+                                 summon->GetSummonerGUID() == boss->GetGUID();
+            // Leave the encounter's target in place so the next tick can approach it.
+            if ((target == boss || isGuard) && bot->IsValidAttackTarget(target) && bot->IsWithinLOSInMap(target))
+                return 0.0f;
+        }
         return 1.0f;
     }
 
