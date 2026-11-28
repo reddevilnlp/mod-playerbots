@@ -125,6 +125,18 @@ protected:
     int moveInterval;
 };
 
+class MoveOutOfDamagingLiquidAction : public MovementAction
+{
+public:
+    MoveOutOfDamagingLiquidAction(PlayerbotAI* botAI) : MovementAction(botAI, "move out of damaging liquid") {}
+
+    bool isUseful() override;
+    bool Execute(Event event) override;
+
+private:
+    bool IsAlreadyLeaving() const;
+};
+
 class CombatFormationMoveAction : public MovementAction
 {
 public:

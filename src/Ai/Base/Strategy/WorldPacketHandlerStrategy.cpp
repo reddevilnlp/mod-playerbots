@@ -52,6 +52,9 @@ void WorldPacketHandlerStrategy::InitTriggers(std::vector<TriggerNode*>& trigger
     triggers.push_back(new TriggerNode("lfg proposal", { NextAction("lfg accept", relevance) }));
     triggers.push_back(new TriggerNode("lfg proposal active", { NextAction("lfg accept", relevance) }));
     triggers.push_back(new TriggerNode("arena team invite", { NextAction("arena team accept", relevance) }));
+    // In every engine, so a bot standing in Naxxramas slime leaves it in and out of combat.
+    triggers.push_back(
+        new TriggerNode("in damaging liquid", { NextAction("move out of damaging liquid", ACTION_EMERGENCY) }));
     //triggers.push_back(new TriggerNode("no non bot players around", { NextAction("delay", relevance) }));
     triggers.push_back(new TriggerNode("bg status", { NextAction("bg status", relevance) }));
     triggers.push_back(new TriggerNode("xpgain", { NextAction("xp gain", relevance) }));

@@ -7,6 +7,7 @@
 #include "GenericTriggers.h"
 #include "Corpse.h"
 #include "CreatureAI.h"
+#include "DamagingLiquid.h"
 #include "GenericBuffUtils.h"
 #include "ItemVisitors.h"
 #include "LastSpellCastValue.h"
@@ -711,3 +712,5 @@ bool ForceRebuffPendingTrigger::IsActive()
 {
     return botAI->forceRebuff.IsPending();
 }
+
+bool InDamagingLiquidTrigger::IsActive() { return bot->IsAlive() && DamagingLiquid::IsIn(bot); }

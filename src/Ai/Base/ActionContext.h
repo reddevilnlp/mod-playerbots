@@ -98,6 +98,7 @@ public:
         creators["flee"] = &ActionContext::flee;
         creators["flee with pet"] = &ActionContext::flee_with_pet;
         creators["avoid aoe"] = &ActionContext::avoid_aoe;
+        creators["move out of damaging liquid"] = &ActionContext::move_out_of_damaging_liquid;
         creators["wake on combat start"] = &ActionContext::wake_on_combat_start;
         creators["combat formation move"] = &ActionContext::combat_formation_move;
         creators["tank face"] = &ActionContext::tank_face;
@@ -322,6 +323,7 @@ private:
     static Action* flee(PlayerbotAI* botAI) { return new FleeAction(botAI); }
     static Action* flee_with_pet(PlayerbotAI* botAI) { return new FleeWithPetAction(botAI); }
     static Action* avoid_aoe(PlayerbotAI* botAI) { return new AvoidAoeAction(botAI); }
+    static Action* move_out_of_damaging_liquid(PlayerbotAI* botAI) { return new MoveOutOfDamagingLiquidAction(botAI); }
     static Action* wake_on_combat_start(PlayerbotAI* botAI) { return new WakeOnCombatStartAction(botAI); }
     static Action* combat_formation_move(PlayerbotAI* botAI) { return new CombatFormationMoveAction(botAI); }
     static Action* tank_face(PlayerbotAI* botAI) { return new TankFaceAction(botAI); }

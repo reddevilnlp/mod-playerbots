@@ -970,4 +970,12 @@ public:
     bool IsActive() override;
 };
 
+class InDamagingLiquidTrigger : public Trigger
+{
+public:
+    InDamagingLiquidTrigger(PlayerbotAI* botAI) : Trigger(botAI, "in damaging liquid") {}
+
+    bool IsActive() override;
+};
+
 #endif

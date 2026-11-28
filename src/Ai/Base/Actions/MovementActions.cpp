@@ -6,6 +6,7 @@
 
 #include "MovementActions.h"
 #include "Corpse.h"
+#include "DamagingLiquid.h"
 #include "Event.h"
 #include "FleeManager.h"
 #include "GameObject.h"
@@ -13,6 +14,7 @@
 #include "LootObjectStack.h"
 #include "Map.h"
 #include "MotionMaster.h"
+#include "MoveSpline.h"
 #include "MoveSplineInitArgs.h"
 #include "MovementGenerator.h"
 #include "ObjectDefines.h"
@@ -34,9 +36,11 @@
 #include "Vehicle.h"
 #include "WaypointMovementGenerator.h"
 #include "G3D/Vector3.h"
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <string>
 
 MovementAction::MovementAction(PlayerbotAI* botAI, std::string const name) : Action(botAI, name)
@@ -1867,6 +1871,65 @@ bool FleeWithPetAction::Execute(Event /*event*/)
         botAI->PetFollow();
 
     return Flee(AI_VALUE(Unit*, "current target"));
+}
+
+bool MoveOutOfDamagingLiquidAction::IsAlreadyLeaving() const
+{
+    if (!bot->isMoving() || bot->movespline->Finalized())
+        return false;
+
+    G3D::Vector3 const dest = bot->movespline->FinalDestination();
+    return !DamagingLiquid::IsAt(bot, dest.x, dest.y, dest.z);
+}
+
+bool MoveOutOfDamagingLiquidAction::isUseful()
+{
+    return DamagingLiquid::IsIn(bot) && !IsAlreadyLeaving();
+}
+
+bool MoveOutOfDamagingLiquidAction::Execute(Event /*event*/)
+{
+    // Nearest ring with a dry, directly reachable point wins; within it, the point closest
+    // to the group leader, so the bot climbs out on the side the group is on.
+    constexpr std::array<float, 5> searchRadii = {3.0f, 6.0f, 10.0f, 15.0f, 20.0f};
+    constexpr uint32 anglesPerRing = 16;
+
+    Player* leader = botAI->GetGroupLeader();
+    bool const useLeader = leader && leader != bot && leader->IsInWorld() && leader->GetMap() == bot->GetMap() &&
+                           !DamagingLiquid::IsIn(leader);
+    Map* map = bot->GetMap();
+
+    for (float const radius : searchRadii)
+    {
+        bool found = false;
+        Position best;
+        float bestScore = std::numeric_limits<float>::max();
+        for (uint32 i = 0; i < anglesPerRing; ++i)
+        {
+            float const angle = 2.0f * static_cast<float>(M_PI) * i / anglesPerRing;
+            float x = bot->GetPositionX() + radius * std::cos(angle);
+            float y = bot->GetPositionY() + radius * std::sin(angle);
+            float z = bot->GetPositionZ();
+            if (!map->CanReachPositionAndGetValidCoords(bot, x, y, z))
+                continue;
+            if (DamagingLiquid::IsAt(bot, x, y, z))
+                continue;
+
+            float const score = useLeader ? leader->GetExactDist(x, y, z) : static_cast<float>(i);
+            if (score < bestScore)
+            {
+                bestScore = score;
+                best.Relocate(x, y, z);
+                found = true;
+            }
+        }
+
+        if (found)
+            return MoveTo(bot->GetMapId(), best.GetPositionX(), best.GetPositionY(), best.GetPositionZ(), false,
+                          false, false, true, MovementPriority::MOVEMENT_FORCED);
+    }
+
+    return false;
 }
 
 bool AvoidAoeAction::isUseful()
